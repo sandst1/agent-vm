@@ -1,0 +1,86 @@
+# Lightweight agent VM — Alpine Linux
+# Managed by agent-vm script. Don't edit manually.
+
+vmType: vz
+os: Linux
+arch: default
+
+cpus: 2
+memory: 4GiB
+disk: 10GiB
+
+images:
+  - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-aarch64-uefi-cloudinit-r0.qcow2"
+    arch: aarch64
+  - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
+    arch: x86_64
+
+networks:
+  - vzNAT: true
+
+containerd:
+  system: false
+  user: false
+
+mounts:
+  # Project directory — fixed path, symlinked from home in provisioning
+  - location: "{{PROJECT_PATH}}"
+    writable: true
+    mountPoint: "/workspace"
+
+  # opencode config — read-only
+  - location: "~/.config/opencode"
+    writable: false
+    mountPoint: "/etc/opencode"
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eux
+      [ -f /etc/agent-vm-provisioned ] && exit 0
+
+      apk update
+      apk add \
+        build-base \
+        git \
+        curl \
+        jq \
+        tmux \
+        ripgrep \
+        fd \
+        unzip \
+        bash \
+        nodejs \
+        npm \
+        python3 \
+        py3-pip
+
+      # Global PATH for agent tools
+      cat > /etc/profile.d/agent-vm.sh << 'PROF'
+      export PATH="$HOME/.opencode/bin:/usr/local/bin:$PATH"
+      PROF
+      chmod +x /etc/profile.d/agent-vm.sh
+
+      touch /etc/agent-vm-provisioned
+
+  - mode: user
+    script: |
+      #!/bin/sh
+      set -eux
+      [ -f ~/.agent-vm-user-provisioned ] && exit 0
+
+      curl -fsSL https://opencode.ai/install | sh
+
+      git clone https://github.com/sandst1/opencode-loop.git ~/.local/share/opencode-loop
+      cd ~/.local/share/opencode-loop
+      npm install
+      npm run build
+      ln -sf ~/.local/share/opencode-loop/dist/index.js ~/.opencode/bin/opencode-loop
+
+      ln -sf /workspace ~/project
+      ln -sf /workspace ~/p
+      mkdir -p ~/.config
+      ln -sf /etc/opencode ~/.config/opencode
+
+      touch ~/.agent-vm-user-provisioned
