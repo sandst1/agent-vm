@@ -58,4 +58,4 @@ opencode config (`~/.config/opencode/`) is mounted read-only — provider keys c
 
 ## What's inside
 
-Alpine Linux 3.23, Node.js, Python 3, git, tmux, ripgrep, fd, curl, jq, build-base, opencode, opencode-loop.
+Alpine Linux 3.23, Node.js, Python 3, git, tmux, ripgrep, fd, curl, jq, build-base, Chromium (headless), agent-browser, opencode, opencode-loop.
