@@ -33,6 +33,11 @@ mounts:
     writable: false
     mountPoint: "/etc/opencode"
 
+  # agent-vm skills — symlinked into ~/.config/opencode/skills
+  - location: "{{SCRIPT_DIR}}/skills"
+    writable: false
+    mountPoint: "/etc/agent-vm-skills"
+
 provision:
   - mode: system
     script: |
@@ -59,10 +64,13 @@ provision:
         font-noto \
         font-noto-emoji
 
+      npm install -g agent-browser
+
       # Global PATH and browser config for agent tools
       cat > /etc/profile.d/agent-vm.sh << 'PROF'
       export PATH="$HOME/.opencode/bin:/usr/local/bin:$PATH"
       export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+      export AGENT_BROWSER_ARGS="--no-sandbox,--disable-gpu,--disable-dev-shm-usage"
       PROF
       chmod +x /etc/profile.d/agent-vm.sh
 
@@ -82,43 +90,13 @@ provision:
       npm run build
       ln -sf ~/.local/share/opencode-loop/dist/index.js ~/.opencode/bin/opencode-loop
 
-      npm install -g agent-browser
-
-      mkdir -p ~/.opencode/skills/agent-browser
-      cat > ~/.opencode/skills/agent-browser/SKILL.md << 'SKILL'
-      # agent-browser
-
-      Browser automation CLI. Headless Chromium is available in this VM.
-
-      ## Core workflow
-
-      1. `agent-browser open <url>` — navigate
-      2. `agent-browser snapshot -i` — get interactive elements with refs (@e1, @e2...)
-      3. `agent-browser click @e1` / `agent-browser fill @e2 "text"` — interact by ref
-      4. Re-snapshot after page changes
-
-      ## Useful commands
-
-      - `agent-browser read <url>` — fetch page as agent-readable text (no browser launch)
-      - `agent-browser screenshot [path]` — take screenshot
-      - `agent-browser eval <js>` — run JavaScript in page
-      - `agent-browser get text @e1` — get element text
-      - `agent-browser wait --text "Welcome"` — wait for text
-      - `agent-browser close` — close browser
-
-      ## Tips
-
-      - Always re-snapshot after navigation or clicks that change the page
-      - Use `snapshot -i` (interactive only) to keep output small
-      - Use `--json` for machine-readable output
-      - Use `agent-browser read <url>` for simple text extraction without a full browser session
-      - Chain commands: `agent-browser open url && agent-browser snapshot -i`
-      - `agent-browser --help` for full command reference
-      SKILL
-
       ln -sf /workspace ~/project
       ln -sf /workspace ~/p
-      mkdir -p ~/.config
-      ln -sf /etc/opencode ~/.config/opencode
+
+      mkdir -p ~/.config/opencode
+      for f in /etc/opencode/*; do
+        [ -e "$f" ] && ln -sf "$f" ~/.config/opencode/
+      done
+      ln -sf /etc/agent-vm-skills ~/.config/opencode/skills
 
       touch ~/.agent-vm-user-provisioned

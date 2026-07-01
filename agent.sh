@@ -37,6 +37,7 @@ generate_yaml() {
   local project_path="$1"
   sed \
     -e "s|{{PROJECT_PATH}}|${project_path}|g" \
+    -e "s|{{SCRIPT_DIR}}|${SCRIPT_DIR}|g" \
     -e "s|{{USER}}|${USER}|g" \
     "$TEMPLATE"
 }
