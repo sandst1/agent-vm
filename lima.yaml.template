@@ -1,5 +1,8 @@
 # Lightweight agent VM — Alpine Linux
-# Managed by agent-vm script. Don't edit manually.
+#
+# This is the template used when agent-vm creates a new VM.
+# {{PROJECT_PATH}} and {{SCRIPT_DIR}} are substituted at runtime.
+# Edit freely: adjust CPUs/RAM/disk, add mounts, install extra packages, etc.
 
 vmType: vz
 os: Linux
