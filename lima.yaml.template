@@ -98,8 +98,23 @@ provision:
 
       mkdir -p ~/.config/opencode
       for f in /etc/opencode/*; do
-        [ -e "$f" ] && ln -sf "$f" ~/.config/opencode/
+        [ -e "$f" ] || continue
+        # skills merged separately — ln -sf into a dir-symlink follows it
+        # and never replaces ~/.config/opencode/skills
+        [ "$(basename "$f")" = "skills" ] && continue
+        ln -sfn "$f" ~/.config/opencode/
       done
-      ln -sf /etc/agent-vm-skills ~/.config/opencode/skills
+
+      # Real directory so host + agent-vm skills can coexist
+      if [ -L ~/.config/opencode/skills ]; then
+        rm ~/.config/opencode/skills
+      fi
+      mkdir -p ~/.config/opencode/skills
+      for s in /etc/opencode/skills/*; do
+        [ -e "$s" ] && ln -sfn "$s" ~/.config/opencode/skills/
+      done
+      for s in /etc/agent-vm-skills/*; do
+        [ -e "$s" ] && ln -sfn "$s" ~/.config/opencode/skills/
+      done
 
       touch ~/.agent-vm-user-provisioned
