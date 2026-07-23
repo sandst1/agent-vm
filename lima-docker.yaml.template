@@ -1,17 +1,19 @@
-# Lightweight agent VM — Alpine Linux (default)
+# Agent VM with Docker — Alpine Linux
 #
-# Default template when agent-vm creates a new VM.
-# For Docker Engine + more disk/RAM, use: agent-vm -t docker
+# Same base as lima.yaml.template, plus Docker Engine and more disk/RAM
+# for image pulls and compose stacks. Use when creating a VM:
+#
+#   agent-vm -t docker
+#
 # {{PROJECT_PATH}} and {{SCRIPT_DIR}} are substituted at runtime.
-# Edit freely: adjust CPUs/RAM/disk, add mounts, install extra packages, etc.
 
 vmType: vz
 os: Linux
 arch: default
 
 cpus: 2
-memory: 4GiB
-disk: 10GiB
+memory: 6GiB
+disk: 30GiB
 
 images:
   - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-aarch64-uefi-cloudinit-r0.qcow2"
@@ -66,7 +68,19 @@ provision:
         py3-pip \
         chromium \
         font-noto \
-        font-noto-emoji
+        font-noto-emoji \
+        docker \
+        docker-cli \
+        docker-cli-compose
+
+      rc-update add docker default
+      service docker start
+
+      # Non-root docker for login users (lima creates one under /home)
+      for d in /home/*; do
+        [ -d "$d" ] || continue
+        addgroup "$(basename "$d")" docker || true
+      done
 
       npm install -g agent-browser
 
@@ -85,6 +99,9 @@ provision:
       #!/bin/sh
       set -eux
       [ -f ~/.agent-vm-user-provisioned ] && exit 0
+
+      # Ensure docker group in case system provision ran before /home existed
+      sudo addgroup "$(id -un)" docker || true
 
       curl -fsSL https://opencode.ai/install | sh
 

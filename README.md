@@ -64,6 +64,7 @@ When you're done, just `exit` the VM shell. The VM keeps running in the backgrou
 
 ```
 agent-vm              Enter VM for current directory (creates on first run)
+agent-vm -t docker    Create with the Docker template (first run only)
 agent-vm list         Show all agent VMs and their status
 agent-vm status       Show VM for current directory
 agent-vm stop [name]  Stop a VM (default: current dir's VM)
@@ -72,6 +73,18 @@ agent-vm delete [name] Delete a VM entirely
 ```
 
 Stop/delete accept shorthand — `agent-vm stop customer-a` works (the `agent-` prefix is added automatically).
+
+### Templates
+
+The default VM stays light ([`lima.yaml.template`](./lima.yaml.template)). Use a different template when creating a VM:
+
+```bash
+agent-vm -t docker                         # lima-docker.yaml.template
+agent-vm --template lima-docker.yaml.template
+agent-vm -t /path/to/custom.yaml           # any Lima YAML
+```
+
+`-t` / `--template` only applies on **first create**. If the VM already exists, delete it first to recreate with another template.
 
 ## Resource usage
 
@@ -100,6 +113,17 @@ Alpine Linux 3.23 with:
 | [opencode](https://opencode.ai/) | AI coding agent |
 | opencode-loop | Autonomous loop runner for opencode |
 
+### Docker template (`agent-vm -t docker`)
+
+Same stack as the default, plus Docker Engine and Compose. Uses 6 GiB RAM and 30 GiB disk so image pulls don’t fill the VM immediately.
+
+| Tool | Purpose |
+|------|---------|
+| Docker Engine | Containers inside the VM (`docker` CLI + daemon) |
+| Docker Compose | `docker compose` via `docker-cli-compose` |
+
+The lima user is added to the `docker` group (no sudo needed for normal use).
+
 ## opencode config — copied from your Mac automatically
 
 > **Your `~/.config/opencode/` directory is mounted read-only from your Mac into the VM.** All provider API keys and opencode settings carry over automatically — no extra setup needed.
@@ -108,11 +132,18 @@ Individual config files are symlinked into `~/.config/opencode/` inside the VM, 
 
 ## VM configuration
 
-VM configuration lives in [`lima.yaml.template`](./lima.yaml.template). When a new VM is created, this template is copied and `{{PROJECT_PATH}}` / `{{SCRIPT_DIR}}` placeholders are substituted at runtime. You're encouraged to edit it — tweak CPU/RAM, add mounts, install extra packages, etc.
+Templates live next to the script:
+
+| File | When |
+|------|------|
+| [`lima.yaml.template`](./lima.yaml.template) | Default (light) |
+| [`lima-docker.yaml.template`](./lima-docker.yaml.template) | `agent-vm -t docker` |
+
+When a new VM is created, the chosen template is copied and `{{PROJECT_PATH}}` / `{{SCRIPT_DIR}}` placeholders are substituted at runtime. You're encouraged to edit them — tweak CPU/RAM, add mounts, install extra packages, etc. Or pass `-t` with your own Lima YAML.
 
 Key sections:
 
-- **`cpus` / `memory` / `disk`** — resource limits per VM (default: 2 CPUs, 4 GiB RAM, 10 GiB disk)
+- **`cpus` / `memory` / `disk`** — resource limits per VM (default: 2 CPUs, 4 GiB RAM, 10 GiB disk; Docker template: 6 GiB / 30 GiB)
 - **`images`** — Alpine Linux cloud images for aarch64 and x86_64
 - **`mounts`** — project dir, opencode config (read-only), and agent-vm skills
 - **`provision.system`** — packages installed as root on first boot

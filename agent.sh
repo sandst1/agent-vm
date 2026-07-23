@@ -6,12 +6,14 @@
 #
 #   cd ~/projects/customer-a && agent-vm       # creates/enters VM
 #   cd ~/projects/customer-b && agent-vm       # separate VM
+#   agent-vm -t docker                         # create with Docker template
 #   agent-vm list                              # see all VMs
 #   agent-vm stop customer-a                   # free the RAM
 
 set -e
 
 VM_PREFIX="agent"
+TEMPLATE_ARG=""
 
 # Resolve real script location (follows symlinks)
 SOURCE="$0"
@@ -21,9 +23,84 @@ while [ -L "$SOURCE" ]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
-TEMPLATE="$SCRIPT_DIR/lima.yaml.template"
+DEFAULT_TEMPLATE="$SCRIPT_DIR/lima.yaml.template"
+
+# --- Arg parsing (global flags) ---
+
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t|--template)
+      if [ -z "${2:-}" ]; then
+        echo "error: $1 requires a template name or path" >&2
+        exit 1
+      fi
+      TEMPLATE_ARG="$2"
+      shift 2
+      ;;
+    --template=*)
+      TEMPLATE_ARG="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      ARGS=(help)
+      shift
+      ;;
+    *)
+      ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+if [ ${#ARGS[@]} -gt 0 ]; then
+  set -- "${ARGS[@]}"
+else
+  set --
+fi
 
 # --- Helpers ---
+
+resolve_template() {
+  local arg="${1:-}"
+  local candidate
+
+  if [ -z "$arg" ]; then
+    echo "$DEFAULT_TEMPLATE"
+    return
+  fi
+
+  # Absolute / relative path that exists
+  if [ -f "$arg" ]; then
+    # shellcheck disable=SC2164
+    (cd "$(dirname "$arg")" && echo "$(pwd)/$(basename "$arg")")
+    return
+  fi
+
+  # Bare path under the agent-vm directory
+  if [ -f "$SCRIPT_DIR/$arg" ]; then
+    echo "$SCRIPT_DIR/$arg"
+    return
+  fi
+
+  # Shorthand: -t docker → lima-docker.yaml.template
+  for candidate in \
+    "$SCRIPT_DIR/lima-${arg}.yaml.template" \
+    "$SCRIPT_DIR/${arg}.yaml.template" \
+    "$SCRIPT_DIR/lima-${arg}.yaml" \
+    "$SCRIPT_DIR/${arg}.yaml"
+  do
+    if [ -f "$candidate" ]; then
+      echo "$candidate"
+      return
+    fi
+  done
+
+  echo "error: template not found: ${arg}" >&2
+  echo "Tried: path, ${SCRIPT_DIR}/${arg}, lima-${arg}.yaml.template" >&2
+  exit 1
+}
+
+TEMPLATE="$(resolve_template "$TEMPLATE_ARG")"
 
 vm_name_for() {
   local dir="${1:-$(pwd)}"
@@ -73,10 +150,14 @@ cmd_shell() {
     generate_yaml "$project_path" > "$tmpfile"
 
     echo "Creating agent VM for $(basename "$project_path") (first run, ~2 min)..."
+    echo "  template: $(basename "$TEMPLATE")"
     limactl create --name "$vm_name" --tty=false "$tmpfile" >/dev/null 2>&1
     rm -f "$tmpfile"
     limactl start "$vm_name" >/dev/null 2>&1
   else
+    if [ -n "$TEMPLATE_ARG" ]; then
+      echo "note: VM already exists; --template is ignored (delete first to recreate)" >&2
+    fi
     if [ "$(vm_status "$vm_name")" != "Running" ]; then
       echo "Starting $(basename "$project_path")..."
       limactl start "$vm_name" >/dev/null 2>&1
@@ -170,6 +251,25 @@ cmd_status() {
   fi
 }
 
+cmd_help() {
+  echo "agent-vm — lightweight Alpine VMs for coding agents"
+  echo ""
+  echo "  agent-vm              Enter VM for current directory (creates on first run)"
+  echo "  agent-vm -t docker    Create with Docker template (first run only)"
+  echo "  agent-vm list         Show all agent VMs and their status"
+  echo "  agent-vm status       Show VM for current directory"
+  echo "  agent-vm stop [name]  Stop a VM (default: current dir's VM)"
+  echo "  agent-vm stop-all     Stop all agent VMs"
+  echo "  agent-vm delete [name] Delete a VM entirely"
+  echo ""
+  echo "Templates (used only when creating a new VM):"
+  echo "  -t, --template NAME   lima.yaml.template (default), docker, or a path"
+  echo "                        Shorthand: docker → lima-docker.yaml.template"
+  echo ""
+  echo "Each project gets its own VM. Run 2-3 in parallel."
+  echo "~4 GB RAM per default VM; Docker template uses ~6 GB + 30 GiB disk."
+}
+
 # --- Main ---
 
 case "${1:-shell}" in
@@ -179,17 +279,8 @@ case "${1:-shell}" in
   delete)   cmd_delete "${2:-}" ;;
   list|ls)  cmd_list ;;
   status)   cmd_status ;;
+  help)     cmd_help ;;
   *)
-    echo "agent-vm — lightweight Alpine VMs for coding agents"
-    echo ""
-    echo "  agent-vm              Enter VM for current directory (creates on first run)"
-    echo "  agent-vm list         Show all agent VMs and their status"
-    echo "  agent-vm status       Show VM for current directory"
-    echo "  agent-vm stop [name]  Stop a VM (default: current dir's VM)"
-    echo "  agent-vm stop-all     Stop all agent VMs"
-    echo "  agent-vm delete [name] Delete a VM entirely"
-    echo ""
-    echo "Each project gets its own VM. Run 2-3 in parallel."
-    echo "~4 GB RAM per VM. Alpine Linux."
+    cmd_help
     ;;
 esac
