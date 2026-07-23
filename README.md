@@ -65,6 +65,7 @@ When you're done, just `exit` the VM shell. The VM keeps running in the backgrou
 ```
 agent-vm              Enter VM for current directory (creates on first run)
 agent-vm -t docker    Create with the Docker template (first run only)
+agent-vm -t custom    Create with your local custom template (first run only)
 agent-vm list         Show all agent VMs and their status
 agent-vm status       Show VM for current directory
 agent-vm stop [name]  Stop a VM (default: current dir's VM)
@@ -81,10 +82,23 @@ The default VM stays light ([`lima.yaml.template`](./lima.yaml.template)). Use a
 ```bash
 agent-vm -t docker                         # lima-docker.yaml.template
 agent-vm --template lima-docker.yaml.template
-agent-vm -t /path/to/custom.yaml           # any Lima YAML
+agent-vm -t custom                         # lima-custom.yaml.template (local only)
+agent-vm -t /path/to/my.yaml               # any Lima YAML
 ```
 
 `-t` / `--template` only applies on **first create**. If the VM already exists, delete it first to recreate with another template.
+
+#### Local custom template (`agent-vm -t custom`)
+
+For a private image/stack you do not want in git, copy the example and edit it locally:
+
+```bash
+cp lima-custom.yaml.template.example lima-custom.yaml.template
+# edit lima-custom.yaml.template — packages, images, CPUs/RAM, mounts, …
+agent-vm -t custom
+```
+
+`lima-custom.yaml.template` is gitignored. The committed starter is [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example).
 
 ## Resource usage
 
@@ -124,6 +138,10 @@ Same stack as the default, plus Docker Engine and Compose. Uses 6 GiB RAM and 
 
 The lima user is added to the `docker` group (no sudo needed for normal use).
 
+### Custom template (`agent-vm -t custom`)
+
+Same idea as Docker, but the file lives only on your machine. Start from [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example), customize freely, and create VMs with `-t custom`. Nothing under `lima-custom.yaml.template` is committed.
+
 ## opencode config — copied from your Mac automatically
 
 > **Your `~/.config/opencode/` directory is mounted read-only from your Mac into the VM.** All provider API keys and opencode settings carry over automatically — no extra setup needed.
@@ -138,6 +156,8 @@ Templates live next to the script:
 |------|------|
 | [`lima.yaml.template`](./lima.yaml.template) | Default (light) |
 | [`lima-docker.yaml.template`](./lima-docker.yaml.template) | `agent-vm -t docker` |
+| [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example) | Starter for local custom (copy → `lima-custom.yaml.template`) |
+| `lima-custom.yaml.template` | `agent-vm -t custom` (gitignored; create locally) |
 
 When a new VM is created, the chosen template is copied and `{{PROJECT_PATH}}` / `{{SCRIPT_DIR}}` placeholders are substituted at runtime. You're encouraged to edit them — tweak CPU/RAM, add mounts, install extra packages, etc. Or pass `-t` with your own Lima YAML.
 

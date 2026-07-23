@@ -7,6 +7,7 @@
 #   cd ~/projects/customer-a && agent-vm       # creates/enters VM
 #   cd ~/projects/customer-b && agent-vm       # separate VM
 #   agent-vm -t docker                         # create with Docker template
+#   agent-vm -t custom                         # create with local custom template
 #   agent-vm list                              # see all VMs
 #   agent-vm stop customer-a                   # free the RAM
 
@@ -83,6 +84,7 @@ resolve_template() {
   fi
 
   # Shorthand: -t docker → lima-docker.yaml.template
+  #             -t custom → lima-custom.yaml.template (local, gitignored)
   for candidate in \
     "$SCRIPT_DIR/lima-${arg}.yaml.template" \
     "$SCRIPT_DIR/${arg}.yaml.template" \
@@ -256,6 +258,7 @@ cmd_help() {
   echo ""
   echo "  agent-vm              Enter VM for current directory (creates on first run)"
   echo "  agent-vm -t docker    Create with Docker template (first run only)"
+  echo "  agent-vm -t custom    Create with local custom template (first run only)"
   echo "  agent-vm list         Show all agent VMs and their status"
   echo "  agent-vm status       Show VM for current directory"
   echo "  agent-vm stop [name]  Stop a VM (default: current dir's VM)"
@@ -263,8 +266,9 @@ cmd_help() {
   echo "  agent-vm delete [name] Delete a VM entirely"
   echo ""
   echo "Templates (used only when creating a new VM):"
-  echo "  -t, --template NAME   lima.yaml.template (default), docker, or a path"
+  echo "  -t, --template NAME   lima.yaml.template (default), docker, custom, or a path"
   echo "                        Shorthand: docker → lima-docker.yaml.template"
+  echo "                                   custom → lima-custom.yaml.template"
   echo ""
   echo "Each project gets its own VM. Run 2-3 in parallel."
   echo "~4 GB RAM per default VM; Docker template uses ~6 GB + 30 GiB disk."

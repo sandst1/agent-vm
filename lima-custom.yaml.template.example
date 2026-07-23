@@ -1,0 +1,128 @@
+# Local custom agent VM — Alpine Linux
+#
+# This file is a starter for a machine-local template that is NOT committed
+# to git. Setup:
+#
+#   cp lima-custom.yaml.template.example lima-custom.yaml.template
+#   # edit lima-custom.yaml.template (packages, images, RAM, mounts, …)
+#   agent-vm -t custom
+#
+# lima-custom.yaml.template is gitignored. {{PROJECT_PATH}} and
+# {{SCRIPT_DIR}} are substituted at runtime.
+
+vmType: vz
+os: Linux
+arch: default
+
+cpus: 2
+memory: 4GiB
+disk: 10GiB
+
+images:
+  - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-aarch64-uefi-cloudinit-r0.qcow2"
+    arch: aarch64
+  - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
+    arch: x86_64
+
+networks:
+  - vzNAT: true
+
+containerd:
+  system: false
+  user: false
+
+mounts:
+  # Project directory — fixed path, symlinked from home in provisioning
+  - location: "{{PROJECT_PATH}}"
+    writable: true
+    mountPoint: "/workspace"
+
+  # opencode config — read-only
+  - location: "~/.config/opencode"
+    writable: false
+    mountPoint: "/etc/opencode"
+
+  # agent-vm skills — symlinked into ~/.config/opencode/skills
+  - location: "{{SCRIPT_DIR}}/skills"
+    writable: false
+    mountPoint: "/etc/agent-vm-skills"
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eux
+      [ -f /etc/agent-vm-provisioned ] && exit 0
+
+      apk update
+      apk add \
+        build-base \
+        git \
+        curl \
+        jq \
+        tmux \
+        ripgrep \
+        fd \
+        unzip \
+        bash \
+        nodejs \
+        npm \
+        python3 \
+        py3-pip \
+        chromium \
+        font-noto \
+        font-noto-emoji
+      # Add your own packages here, e.g.:
+      #   rust cargo go openjdk21
+
+      npm install -g agent-browser
+
+      # Global PATH and browser config for agent tools
+      cat > /etc/profile.d/agent-vm.sh << 'PROF'
+      export PATH="$HOME/.opencode/bin:/usr/local/bin:$PATH"
+      export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+      export AGENT_BROWSER_ARGS="--no-sandbox,--disable-gpu,--disable-dev-shm-usage"
+      PROF
+      chmod +x /etc/profile.d/agent-vm.sh
+
+      touch /etc/agent-vm-provisioned
+
+  - mode: user
+    script: |
+      #!/bin/sh
+      set -eux
+      [ -f ~/.agent-vm-user-provisioned ] && exit 0
+
+      curl -fsSL https://opencode.ai/install | sh
+
+      git clone https://github.com/sandst1/opencode-loop.git ~/.local/share/opencode-loop
+      cd ~/.local/share/opencode-loop
+      npm install
+      npm run build
+      ln -sf ~/.local/share/opencode-loop/dist/index.js ~/.opencode/bin/opencode-loop
+
+      ln -sf /workspace ~/project
+      ln -sf /workspace ~/p
+
+      mkdir -p ~/.config/opencode
+      for f in /etc/opencode/*; do
+        [ -e "$f" ] || continue
+        # skills merged separately — ln -sf into a dir-symlink follows it
+        # and never replaces ~/.config/opencode/skills
+        [ "$(basename "$f")" = "skills" ] && continue
+        ln -sfn "$f" ~/.config/opencode/
+      done
+
+      # Real directory so host + agent-vm skills can coexist
+      if [ -L ~/.config/opencode/skills ]; then
+        rm ~/.config/opencode/skills
+      fi
+      mkdir -p ~/.config/opencode/skills
+      for s in /etc/opencode/skills/*; do
+        [ -e "$s" ] && ln -sfn "$s" ~/.config/opencode/skills/
+      done
+      for s in /etc/agent-vm-skills/*; do
+        [ -e "$s" ] && ln -sfn "$s" ~/.config/opencode/skills/
+      done
+
+      touch ~/.agent-vm-user-provisioned
