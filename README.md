@@ -58,7 +58,7 @@ agent-vm          # creates a separate VM, runs in parallel
 opencode
 ```
 
-When you're done, just `exit` the VM shell. The VM keeps running in the background so re-entering is instant. Stop it to free RAM when you don't need it anymore.
+When you're done, `exit` the VM shell. agent-vm closes its SSH forwards and stops the VM automatically, so guest workloads and Lima host helpers do not keep consuming resources.
 
 ## Commands
 
@@ -144,7 +144,7 @@ Same idea as Docker, but the file lives only on your machine. Start from [`lima-
 
 ## opencode config — copied from your Mac automatically
 
-> **Your `~/.config/opencode/` directory is mounted read-only from your Mac into the VM.** All provider API keys and opencode settings carry over automatically — no extra setup needed.
+> **The default and Docker templates mount `~/.config/opencode/` read-only from your Mac into the VM.** Read-only prevents modification, not credential theft; do not use those templates when host-key isolation is required.
 
 Individual config files are symlinked into `~/.config/opencode/` inside the VM, so opencode sees them exactly as it would on your host. The agent-vm skills bundled in this repo are also linked in as an additional skills directory.
 

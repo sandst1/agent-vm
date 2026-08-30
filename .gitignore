@@ -1,2 +1,3 @@
 # Local-only Lima template — copy from lima-custom.yaml.template.example
 lima-custom.yaml.template
+lima-private.yaml.template
