@@ -23,6 +23,29 @@ Browser automation CLI. Headless Chromium is available in this VM.
 - `agent-browser wait --text "Welcome"` — wait for text
 - `agent-browser close` — close browser
 
+## Long-running servers (Vite, etc.)
+
+OpenCode’s bash tool kills background jobs when the shell ends. Do **not** use `&`, `nohup`, or `disown` for dev servers. Use **tmux** instead.
+
+**Start** (idempotent):
+
+```bash
+tmux has-session -t vite 2>/dev/null || tmux new-session -d -s vite 'cd /workspace && npm run dev'
+# wait until HTTP responds (adjust port if needed)
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  curl -sf -o /dev/null http://localhost:3000/ && break
+  sleep 1
+done
+```
+
+**Stop**:
+
+```bash
+tmux kill-session -t vite 2>/dev/null || true
+```
+
+**Logs**: `tmux capture-pane -t vite -p`
+
 ## Tips
 
 - Always re-snapshot after navigation or clicks that change the page
@@ -30,4 +53,6 @@ Browser automation CLI. Headless Chromium is available in this VM.
 - Use `--json` for machine-readable output
 - Use `agent-browser read <url>` for simple text extraction without a full browser session
 - Chain commands: `agent-browser open url && agent-browser snapshot -i`
+- Screenshot: `agent-browser screenshot /tmp/shot.png` (path positional — avoid inventing `--url` flags)
+- Close when done: `agent-browser close`
 - `agent-browser --help` for full command reference

@@ -21,6 +21,12 @@ BROKER_PID=""
 BROKER_PORT=""
 BROKER_READY_FILE=""
 BROKER_LOG_FILE=""
+OPENCODE_BROKER_GUEST_PORT=43112
+OPENCODE_BROKER_SCRIPT=""
+OPENCODE_BROKER_PID=""
+OPENCODE_BROKER_PORT=""
+OPENCODE_BROKER_READY_FILE=""
+OPENCODE_BROKER_LOG_FILE=""
 
 # Resolve real script location (follows symlinks)
 SOURCE="$0"
@@ -32,6 +38,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 DEFAULT_TEMPLATE="$SCRIPT_DIR/lima.yaml.template"
 PI_BROKER_SCRIPT="$SCRIPT_DIR/pi-credential-broker.mjs"
+OPENCODE_BROKER_SCRIPT="$SCRIPT_DIR/opencode-credential-broker.mjs"
 
 # --- Arg parsing (global flags) ---
 
@@ -122,11 +129,13 @@ vm_name_for() {
 generate_yaml() {
   local project_path="$1"
   local pi_config_path="${2:-}"
+  local opencode_config_path="${3:-}"
   sed \
     -e "s|{{PROJECT_PATH}}|${project_path}|g" \
     -e "s|{{SCRIPT_DIR}}|${SCRIPT_DIR}|g" \
     -e "s|{{USER}}|${USER}|g" \
     -e "s|{{PI_CONFIG_PATH}}|${pi_config_path}|g" \
+    -e "s|{{OPENCODE_CONFIG_PATH}}|${opencode_config_path}|g" \
     "$TEMPLATE"
 }
 
@@ -154,6 +163,16 @@ vm_uses_pi_broker() {
   local name="$1"
   limactl list --json 2>/dev/null \
     | jq -e "select(.name==\"${name}\") | .config.env.AGENT_VM_PI_BROKER == \"1\"" >/dev/null 2>&1
+}
+
+template_uses_opencode_broker() {
+  grep -q '^# agent-vm: opencode-broker$' "$TEMPLATE"
+}
+
+vm_uses_opencode_broker() {
+  local name="$1"
+  limactl list --json 2>/dev/null \
+    | jq -e "select(.name==\"${name}\") | .config.env.AGENT_VM_OPENCODE_BROKER == \"1\"" >/dev/null 2>&1
 }
 
 prepare_pi_config() {
@@ -225,6 +244,87 @@ prepare_pi_config() {
   echo "$target_dir"
 }
 
+prepare_opencode_config() {
+  local name="$1"
+  local source_dir="$HOME/.config/opencode"
+  local auth_path="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json"
+  local cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/agent-vm/opencode"
+  local target_dir="$cache_root/$name"
+  local tmp_dir
+  local source_json="$source_dir/opencode.json"
+  local dummy="agent-vm-broker"
+  local broker_base="http://127.0.0.1:${OPENCODE_BROKER_GUEST_PORT}/provider"
+  local sensitive='^(apiKey|api_key|key|token|secret|password|credential|authorization|refresh|access)$'
+
+  if [ ! -d "$source_dir" ] && [ ! -f "$auth_path" ]; then
+    echo "error: host OpenCode config not found at ${source_dir}" >&2
+    exit 1
+  fi
+
+  mkdir -p "$cache_root"
+  chmod 700 "$cache_root"
+  tmp_dir=$(mktemp -d "$cache_root/${name}.XXXXXX")
+  chmod 700 "$tmp_dir"
+
+  if [ -d "$source_dir" ]; then
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --exclude node_modules --exclude .git --exclude package-lock.json \
+        "$source_dir/" "$tmp_dir/"
+    else
+      cp -R "$source_dir/." "$tmp_dir/"
+      rm -rf "$tmp_dir/node_modules" "$tmp_dir/.git" "$tmp_dir/package-lock.json"
+    fi
+  fi
+
+  local ids_file="$tmp_dir/.broker-ids"
+  {
+    jq -r 'keys[]' "$auth_path" 2>/dev/null || true
+    if [ -f "$source_json" ]; then
+      jq -r '.provider // .providers // {} | to_entries[] | select(.value.options.apiKey != null) | .key' \
+        "$source_json" 2>/dev/null || true
+    fi
+  } | awk 'NF' | sort -u > "$ids_file"
+
+  local ids_json
+  ids_json=$(jq -R . < "$ids_file" | jq -s .)
+
+  if [ -f "$source_json" ]; then
+    jq --arg base "$broker_base" --arg dummy "$dummy" --arg sensitive "$sensitive" --argjson ids "$ids_json" '
+      walk(if type == "object" then with_entries(select(.key | test($sensitive; "i") | not)) else . end)
+      | .provider = (.provider // {})
+      | reduce $ids[] as $id (
+          .;
+          .provider[$id] = ((.provider[$id] // {}) + {
+            options: ((.provider[$id].options // {}) + {
+              baseURL: ($base + "/" + $id),
+              apiKey: $dummy
+            })
+          })
+        )
+    ' "$source_json" > "$tmp_dir/opencode.json"
+  else
+    jq -n --arg base "$broker_base" --arg dummy "$dummy" --argjson ids "$ids_json" '
+      {
+        provider: (
+          $ids
+          | map({key: ., value: {options: {baseURL: ($base + "/" + .), apiKey: $dummy}}})
+          | from_entries
+        )
+      }
+    ' > "$tmp_dir/opencode.json"
+  fi
+
+  jq -n --arg dummy "$dummy" --argjson ids "$ids_json" '
+    $ids | map({key: ., value: {type: "api", key: $dummy}}) | from_entries
+  ' > "$tmp_dir/auth.json"
+  rm -f "$ids_file"
+  chmod 600 "$tmp_dir/opencode.json" "$tmp_dir/auth.json"
+
+  rm -rf "$target_dir"
+  mv "$tmp_dir" "$target_dir"
+  echo "$target_dir"
+}
+
 start_pi_broker() {
   local runtime_root="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
   BROKER_READY_FILE=$(mktemp "$runtime_root/agent-vm-broker-ready.XXXXXX")
@@ -251,6 +351,32 @@ start_pi_broker() {
   BROKER_PORT=$(jq -er '.port' "$BROKER_READY_FILE")
 }
 
+start_opencode_broker() {
+  local runtime_root="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+  OPENCODE_BROKER_READY_FILE=$(mktemp "$runtime_root/agent-vm-broker-ready.XXXXXX")
+  OPENCODE_BROKER_LOG_FILE=$(mktemp "$runtime_root/agent-vm-broker-log.XXXXXX")
+
+  node "$OPENCODE_BROKER_SCRIPT" >"$OPENCODE_BROKER_READY_FILE" 2>"$OPENCODE_BROKER_LOG_FILE" &
+  OPENCODE_BROKER_PID=$!
+
+  local attempts=0
+  while [ ! -s "$OPENCODE_BROKER_READY_FILE" ]; do
+    if ! kill -0 "$OPENCODE_BROKER_PID" 2>/dev/null; then
+      echo "error: OpenCode credential broker failed to start" >&2
+      cat "$OPENCODE_BROKER_LOG_FILE" >&2
+      return 1
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 100 ]; then
+      echo "error: timed out waiting for OpenCode credential broker" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+
+  OPENCODE_BROKER_PORT=$(jq -er '.port' "$OPENCODE_BROKER_READY_FILE")
+}
+
 stop_pi_broker() {
   if [ -n "$BROKER_PID" ] && kill -0 "$BROKER_PID" 2>/dev/null; then
     kill "$BROKER_PID" 2>/dev/null || true
@@ -259,6 +385,21 @@ stop_pi_broker() {
   [ -z "$BROKER_READY_FILE" ] || rm -f "$BROKER_READY_FILE"
   [ -z "$BROKER_LOG_FILE" ] || rm -f "$BROKER_LOG_FILE"
   BROKER_PID=""
+}
+
+stop_opencode_broker() {
+  if [ -n "$OPENCODE_BROKER_PID" ] && kill -0 "$OPENCODE_BROKER_PID" 2>/dev/null; then
+    kill "$OPENCODE_BROKER_PID" 2>/dev/null || true
+    wait "$OPENCODE_BROKER_PID" 2>/dev/null || true
+  fi
+  [ -z "$OPENCODE_BROKER_READY_FILE" ] || rm -f "$OPENCODE_BROKER_READY_FILE"
+  [ -z "$OPENCODE_BROKER_LOG_FILE" ] || rm -f "$OPENCODE_BROKER_LOG_FILE"
+  OPENCODE_BROKER_PID=""
+}
+
+stop_brokers() {
+  stop_pi_broker
+  stop_opencode_broker
 }
 
 stop_vm_verified() {
@@ -290,12 +431,17 @@ cmd_shell() {
   local vm_name
   vm_name=$(vm_name_for "$project_path")
   local use_pi_broker=false
+  local use_opencode_broker=false
   local pi_config_path=""
+  local opencode_config_path=""
+  local start_opencode_tunnel=false
 
   if vm_exists "$vm_name"; then
     vm_uses_pi_broker "$vm_name" && use_pi_broker=true
-  elif template_uses_pi_broker; then
-    use_pi_broker=true
+    vm_uses_opencode_broker "$vm_name" && use_opencode_broker=true
+  else
+    template_uses_pi_broker && use_pi_broker=true
+    template_uses_opencode_broker && use_opencode_broker=true
   fi
 
   if [ "$use_pi_broker" = true ]; then
@@ -306,10 +452,21 @@ cmd_shell() {
     pi_config_path=$(prepare_pi_config "$vm_name")
   fi
 
+  if [ "$use_opencode_broker" = true ]; then
+    if [ ! -f "$OPENCODE_BROKER_SCRIPT" ]; then
+      echo "error: missing OpenCode credential broker: ${OPENCODE_BROKER_SCRIPT}" >&2
+      exit 1
+    fi
+    opencode_config_path=$(prepare_opencode_config "$vm_name")
+    if jq -e 'length > 0' "$opencode_config_path/auth.json" >/dev/null 2>&1; then
+      start_opencode_tunnel=true
+    fi
+  fi
+
   if ! vm_exists "$vm_name"; then
     local tmpfile
     tmpfile=$(mktemp /tmp/lima-XXXXX.yaml)
-    generate_yaml "$project_path" "$pi_config_path" > "$tmpfile"
+    generate_yaml "$project_path" "$pi_config_path" "$opencode_config_path" > "$tmpfile"
 
     echo "Creating agent VM for $(basename "$project_path") (first run, ~2 min)..."
     echo "  template: $(basename "$TEMPLATE")"
@@ -334,7 +491,7 @@ cmd_shell() {
     [ "$cleanup_done" = true ] && return
     cleanup_done=true
     trap - EXIT HUP INT TERM
-    stop_pi_broker
+    stop_brokers
     echo "Stopping ${vm_name}..."
     stop_vm_verified "$vm_name" || true
     return "$status"
@@ -344,19 +501,29 @@ cmd_shell() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
+  local ssh_args=(-qt -F "$HOME/.lima/${vm_name}/ssh.config")
+  local remote_cmd='cd /workspace; exec bash --login'
+
+  if [ "$use_pi_broker" = true ] || [ "$start_opencode_tunnel" = true ]; then
+    ssh_args+=(-o ExitOnForwardFailure=yes)
+  fi
+
   if [ "$use_pi_broker" = true ]; then
     start_pi_broker
-    ssh -qt \
-      -o ExitOnForwardFailure=yes \
-      -R "127.0.0.1:${PI_BROKER_GUEST_PORT}:127.0.0.1:${BROKER_PORT}" \
-      -F "$HOME/.lima/${vm_name}/ssh.config" \
-      "lima-${vm_name}" -- \
-      'mkdir -p ~/.pi/agent; cp /etc/agent-vm-pi/*.json ~/.pi/agent/; chmod 600 ~/.pi/agent/auth.json; cd /workspace; exec bash --login' \
-      || shell_status=$?
-  else
-    ssh -qt -F "$HOME/.lima/${vm_name}/ssh.config" "lima-${vm_name}" -- \
-      'cd /workspace; exec bash --login' || shell_status=$?
+    ssh_args+=(-R "127.0.0.1:${PI_BROKER_GUEST_PORT}:127.0.0.1:${BROKER_PORT}")
+    remote_cmd="mkdir -p ~/.pi/agent; cp /etc/agent-vm-pi/*.json ~/.pi/agent/; chmod 600 ~/.pi/agent/auth.json; ${remote_cmd}"
   fi
+
+  if [ "$start_opencode_tunnel" = true ]; then
+    start_opencode_broker
+    ssh_args+=(-R "127.0.0.1:${OPENCODE_BROKER_GUEST_PORT}:127.0.0.1:${OPENCODE_BROKER_PORT}")
+  fi
+
+  if [ "$use_opencode_broker" = true ]; then
+    remote_cmd="mkdir -p ~/.local/share/opencode; if [ -f /etc/opencode/auth.json ]; then cp /etc/opencode/auth.json ~/.local/share/opencode/auth.json; chmod 600 ~/.local/share/opencode/auth.json; fi; ${remote_cmd}"
+  fi
+
+  ssh "${ssh_args[@]}" "lima-${vm_name}" -- "$remote_cmd" || shell_status=$?
 
   cleanup_shell
   trap - EXIT

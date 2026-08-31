@@ -142,11 +142,20 @@ The lima user is added to the `docker` group (no sudo needed for normal use).
 
 Same idea as Docker, but the file lives only on your machine. Start from [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example), customize freely, and create VMs with `-t custom`. Nothing under `lima-custom.yaml.template` is committed.
 
-## opencode config — copied from your Mac automatically
+## opencode config — credentials stay on your Mac
 
-> **The default and Docker templates mount `~/.config/opencode/` read-only from your Mac into the VM.** Read-only prevents modification, not credential theft; do not use those templates when host-key isolation is required.
+Templates marked `# agent-vm: opencode-broker` (the default, Docker, and custom example) do **not** mount your host OpenCode credentials into the VM. Instead:
 
-Individual config files are symlinked into `~/.config/opencode/` inside the VM, so opencode sees them exactly as it would on your host. The agent-vm skills bundled in this repo are also linked in as an additional skills directory.
+1. agent-vm copies a sanitized `~/.config/opencode/` into a cache dir (API keys and auth tokens stripped).
+2. Providers that need host credentials (`~/.local/share/opencode/auth.json`, or `options.apiKey` in config) are rewritten to a dummy key whose `baseURL` is a localhost broker.
+3. A host-side broker (`opencode-credential-broker.mjs`) injects the real key or GitHub Copilot OAuth token when proxying inference requests.
+4. The guest only sees the dummy key; the reverse SSH tunnel is the only path to the real provider.
+
+Local providers without secrets (LAN `baseURL`s, no API key) are left pointing at their original endpoints.
+
+Existing VMs keep their original mounts until you `agent-vm delete` and recreate them.
+
+The agent-vm skills bundled in this repo are still linked in as an additional skills directory.
 
 ## VM configuration
 
@@ -165,7 +174,7 @@ Key sections:
 
 - **`cpus` / `memory` / `disk`** — resource limits per VM (default: 2 CPUs, 4 GiB RAM, 10 GiB disk; Docker template: 6 GiB / 30 GiB)
 - **`images`** — Alpine Linux cloud images for aarch64 and x86_64
-- **`mounts`** — project dir, opencode config (read-only), and agent-vm skills
+- **`mounts`** — project dir, sanitized opencode config (no host keys), and agent-vm skills
 - **`provision.system`** — packages installed as root on first boot
 - **`provision.user`** — opencode + opencode-loop installed as the default user; config symlinks set up here
 

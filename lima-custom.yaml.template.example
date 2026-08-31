@@ -1,4 +1,5 @@
 # Local custom agent VM — Alpine Linux
+# agent-vm: opencode-broker
 #
 # This file is a starter for a machine-local template that is NOT committed
 # to git. Setup:
@@ -31,14 +32,17 @@ containerd:
   system: false
   user: false
 
+env:
+  AGENT_VM_OPENCODE_BROKER: "1"
+
 mounts:
   # Project directory — fixed path, symlinked from home in provisioning
   - location: "{{PROJECT_PATH}}"
     writable: true
     mountPoint: "/workspace"
 
-  # opencode config — read-only
-  - location: "~/.config/opencode"
+  # Sanitized OpenCode config (host credentials stay on the Mac)
+  - location: "{{OPENCODE_CONFIG_PATH}}"
     writable: false
     mountPoint: "/etc/opencode"
 
@@ -110,6 +114,7 @@ provision:
         # skills merged separately — ln -sf into a dir-symlink follows it
         # and never replaces ~/.config/opencode/skills
         [ "$(basename "$f")" = "skills" ] && continue
+        [ "$(basename "$f")" = "auth.json" ] && continue
         ln -sfn "$f" ~/.config/opencode/
       done
 
