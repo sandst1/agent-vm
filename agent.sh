@@ -468,18 +468,31 @@ cmd_shell() {
     tmpfile=$(mktemp /tmp/lima-XXXXX.yaml)
     generate_yaml "$project_path" "$pi_config_path" "$opencode_config_path" > "$tmpfile"
 
-    echo "Creating agent VM for $(basename "$project_path") (first run, ~2 min)..."
+    echo "Creating agent VM for $(basename "$project_path")..."
     echo "  template: $(basename "$TEMPLATE")"
-    limactl create --name "$vm_name" --tty=false "$tmpfile" >/dev/null 2>&1
+    if ! limactl create --name "$vm_name" --tty=false "$tmpfile"; then
+      rm -f "$tmpfile"
+      echo "error: failed to create ${vm_name}" >&2
+      return 1
+    fi
     rm -f "$tmpfile"
-    limactl start "$vm_name" >/dev/null 2>&1
+    echo "Starting and provisioning ${vm_name} (first boot can take several minutes)..."
+    if ! limactl start "$vm_name"; then
+      echo "error: failed to start or provision ${vm_name}" >&2
+      echo "debug log: $HOME/.lima/${vm_name}/ha.stderr.log" >&2
+      return 1
+    fi
   else
     if [ -n "$TEMPLATE_ARG" ]; then
       echo "note: VM already exists; --template is ignored (delete first to recreate)" >&2
     fi
     if [ "$(vm_status "$vm_name")" != "Running" ]; then
       echo "Starting $(basename "$project_path")..."
-      limactl start "$vm_name" >/dev/null 2>&1
+      if ! limactl start "$vm_name"; then
+        echo "error: failed to start ${vm_name}" >&2
+        echo "debug log: $HOME/.lima/${vm_name}/ha.stderr.log" >&2
+        return 1
+      fi
     fi
   fi
 
