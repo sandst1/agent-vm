@@ -1,5 +1,6 @@
 # Agent VM with Docker — Alpine Linux
 # agent-vm: opencode-broker
+# agent-vm: restricted-egress
 #
 # Same base as lima.yaml.template, plus Docker Engine and more disk/RAM
 # for image pulls and compose stacks. Use when creating a VM:
@@ -22,15 +23,13 @@ images:
   - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
     arch: x86_64
 
-networks:
-  - vzNAT: true
-
 containerd:
   system: false
   user: false
 
 env:
   AGENT_VM_OPENCODE_BROKER: "1"
+  AGENT_VM_RESTRICTED_EGRESS: "1"
 
 mounts:
   # Project directory — fixed path, symlinked from home in provisioning
@@ -73,24 +72,130 @@ provision:
         chromium \
         font-noto \
         font-noto-emoji \
-        docker \
         docker-cli \
-        docker-cli-compose
+        docker-cli-compose \
+        docker-rootless-extras \
+        docker-rootless-extras-openrc \
+        nftables \
+        shadow-subids \
+        socat
 
-      rc-update add docker default
-      service docker start
+      agent_user="{{USER}}"
+      [ -n "$agent_user" ]
+      agent_uid="$(id -u "$agent_user")"
+      agent_gid="$(id -g "$agent_user")"
+      guest_ip="$(ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+      [ -n "$guest_ip" ]
 
-      # Non-root docker for login users (lima creates one under /home)
-      for d in /home/*; do
-        [ -d "$d" ] || continue
-        addgroup "$(basename "$d")" docker || true
+      sed -i '/[[:space:]]agent-vm-egress\.internal$/d' /etc/hosts
+      echo "${guest_ip} agent-vm-egress.internal" >> /etc/hosts
+      mkdir -p /etc/ssh/sshd_config.d
+      cat > /etc/ssh/sshd_config.d/90-agent-vm-egress.conf << 'SSHD'
+      GatewayPorts clientspecified
+      SSHD
+      rc-service sshd reload
+
+      grep -q "^${agent_user}:" /etc/subuid 2>/dev/null \
+        || echo "${agent_user}:100000:65536" >> /etc/subuid
+      grep -q "^${agent_user}:" /etc/subgid 2>/dev/null \
+        || echo "${agent_user}:100000:65536" >> /etc/subgid
+
+      if grep -q '^rc_cgroup_mode=' /etc/rc.conf; then
+        sed -i 's/^rc_cgroup_mode=.*/rc_cgroup_mode="unified"/' /etc/rc.conf
+      else
+        echo 'rc_cgroup_mode="unified"' >> /etc/rc.conf
+      fi
+      rc-update add cgroups default
+      service cgroups start || true
+
+      install -d -m 700 -o "$agent_uid" -g "$agent_gid" "/run/user/${agent_uid}"
+
+      cat > /etc/nftables.nft << NFT
+      table inet agent_vm_egress {
+        chain output {
+          type filter hook output priority 0; policy accept;
+          ct state established,related accept
+          meta skuid ${agent_uid} ip daddr 127.0.0.0/8 accept
+          meta skuid ${agent_uid} ip6 daddr ::1 accept
+          ip daddr ${guest_ip} tcp dport 43113 accept
+          meta skuid ${agent_uid} reject
+          meta skuid 100000-165535 reject
+        }
+        chain forward {
+          type filter hook forward priority 0; policy drop;
+        }
+      }
+      NFT
+      rc-update add nftables default
+
+      cat > /usr/local/bin/agent-vm-start-docker << 'DOCKER_START'
+      #!/bin/sh
+      set -eu
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+      docker_socket="${XDG_RUNTIME_DIR}/docker.sock"
+      export DOCKER_HOST="unix://${docker_socket}"
+
+      if ! docker info >/dev/null 2>&1; then
+        mkdir -p "$XDG_RUNTIME_DIR" "$HOME/.local/state"
+        chmod 700 "$XDG_RUNTIME_DIR"
+        export HTTP_PROXY="http://agent-vm-egress.internal:43113"
+        export HTTPS_PROXY="$HTTP_PROXY"
+        export http_proxy="$HTTP_PROXY"
+        export https_proxy="$HTTP_PROXY"
+        export NO_PROXY="127.0.0.1,localhost"
+        export no_proxy="$NO_PROXY"
+        export DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
+        export DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=true
+
+        nohup dockerd-rootless --host="$DOCKER_HOST" \
+          >"$HOME/.local/state/dockerd-rootless.log" 2>&1 </dev/null &
+
+        attempts=0
+        until docker info >/dev/null 2>&1; do
+          attempts=$((attempts + 1))
+          if [ "$attempts" -ge 100 ]; then
+            echo "rootless Docker failed to start" >&2
+            tail -n 50 "$HOME/.local/state/dockerd-rootless.log" >&2 || true
+            exit 1
+          fi
+          sleep 0.1
+        done
+      fi
+
+      docker_bridge="/tmp/agent-vm-docker.sock"
+      if ! docker -H "unix://${docker_bridge}" info >/dev/null 2>&1; then
+        rm -f "$docker_bridge"
+        nohup socat "UNIX-LISTEN:${docker_bridge},mode=600,fork" \
+          "UNIX-CONNECT:${docker_socket}" \
+          >"$HOME/.local/state/docker-bridge.log" 2>&1 </dev/null &
+      fi
+
+      export DOCKER_HOST="unix://${docker_bridge}"
+      attempts=0
+      until docker info >/dev/null 2>&1; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 50 ] || {
+          echo "rootless Docker bridge failed to start" >&2
+          exit 1
+        }
+        sleep 0.1
       done
+      DOCKER_START
+      chmod 755 /usr/local/bin/agent-vm-start-docker
 
       npm install -g agent-browser
 
       # Global PATH and browser config for agent tools
       cat > /etc/profile.d/agent-vm.sh << 'PROF'
       export PATH="$HOME/.opencode/bin:/usr/local/bin:$PATH"
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+      export DOCKER_HOST="unix:///tmp/agent-vm-docker.sock"
+      export HTTP_PROXY="http://127.0.0.1:43113"
+      export HTTPS_PROXY="$HTTP_PROXY"
+      export http_proxy="$HTTP_PROXY"
+      export https_proxy="$HTTP_PROXY"
+      export NO_PROXY="127.0.0.1,localhost"
+      export no_proxy="$NO_PROXY"
       export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser
       export AGENT_BROWSER_ARGS="--no-sandbox,--disable-gpu,--disable-dev-shm-usage"
       PROF
@@ -98,14 +203,26 @@ provision:
 
       touch /etc/agent-vm-provisioned
 
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eux
+      agent_user="{{USER}}"
+      agent_uid="$(id -u "$agent_user")"
+      agent_gid="$(id -g "$agent_user")"
+      agent_home="$(getent passwd "$agent_user" | cut -d: -f6)"
+      install -d -m 700 -o "$agent_uid" -g "$agent_gid" "/run/user/${agent_uid}"
+      if [ -f "$agent_home/.agent-vm-user-provisioned" ]; then
+        nft delete table inet agent_vm_egress 2>/dev/null || true
+        nft -f /etc/nftables.nft
+        rm -f /etc/sudoers.d/90-lima-users
+      fi
+
   - mode: user
     script: |
       #!/bin/sh
       set -eux
       [ -f ~/.agent-vm-user-provisioned ] && exit 0
-
-      # Ensure docker group in case system provision ran before /home existed
-      sudo addgroup "$(id -un)" docker || true
 
       curl -fsSL https://opencode.ai/install | sh
 
@@ -140,4 +257,14 @@ provision:
         [ -e "$s" ] && ln -sfn "$s" ~/.config/opencode/skills/
       done
 
+      npm config set proxy http://127.0.0.1:43113
+      npm config set https-proxy http://127.0.0.1:43113
+
+      mkdir -p ~/.docker
+      guest_ip="$(getent hosts agent-vm-egress.internal | awk 'NR == 1 { print $1 }')"
+      printf '%s\n' "{\"proxies\":{\"default\":{\"httpProxy\":\"http://${guest_ip}:43113\",\"httpsProxy\":\"http://${guest_ip}:43113\",\"noProxy\":\"127.0.0.1,localhost\"}}}" > ~/.docker/config.json
+      chmod 600 ~/.docker/config.json
+
       touch ~/.agent-vm-user-provisioned
+      sudo nft -f /etc/nftables.nft
+      sudo rm -f /etc/sudoers.d/90-lima-users

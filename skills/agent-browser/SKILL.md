@@ -7,6 +7,21 @@ description: Browser automation CLI for web interaction, scraping, and testing
 
 Browser automation CLI. Headless Chromium is available in this VM.
 
+## Network boundary
+
+External sites are denied by default in Docker-bearing agent VMs. Before
+launching the VM, review each target and allow its exact HTTPS hostname for
+that session:
+
+```bash
+agent-vm -t codex --allow-domain example.com
+```
+
+Repeat `--allow-domain` for page assets hosted on other reviewed domains. The
+override expires when the VM shell exits. IP literals, private/LAN targets, and
+plain HTTP remain blocked. Guest-local development servers are available
+without an override.
+
 ## Core workflow
 
 1. `agent-browser open <url>` — navigate

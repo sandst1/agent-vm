@@ -6,7 +6,7 @@ Lightweight Alpine Linux VMs for coding agents on macOS. Each project gets its o
 
 ## Why?
 
-AI coding agents (like [opencode](https://opencode.ai/)) work best when they can install packages, run builds, and execute arbitrary commands without risk to your host machine. agent-vm gives each project a throwaway Linux sandbox: the agent gets full root access inside the VM while your Mac stays clean. If something goes wrong, just delete the VM and start fresh.
+AI coding agents (like [opencode](https://opencode.ai/)) work best when they can install packages, run builds, and execute arbitrary commands without risk to your host machine. agent-vm gives each project a throwaway Linux sandbox while your Mac stays clean. The Docker-bearing templates additionally remove guest root access and restrict outbound networking. If something goes wrong, just delete the VM and start fresh.
 
 This is an example setup for **folder-scoped VMs on Mac** — one VM per folder, named after the directory. The folder you `cd` into is what gets mounted, so you choose the scope: a single project, a monorepo, or a top-level `~/projects` directory that contains everything. How many VMs you run and what each one sees is entirely up to you.
 
@@ -66,6 +66,8 @@ When you're done, `exit` the VM shell. agent-vm closes its SSH forwards and stop
 agent-vm              Enter VM for current directory (creates on first run)
 agent-vm -t docker    Create with the Docker template (first run only)
 agent-vm -t codex     Create with the Codex + Docker template (first run only)
+agent-vm --allow-domain HOST
+                      Allow one extra HTTPS hostname for this session
 agent-vm -t custom    Create with your local custom template (first run only)
 agent-vm list         Show all agent VMs and their status
 agent-vm status       Show VM for current directory
@@ -83,6 +85,7 @@ The default VM stays light ([`lima.yaml.template`](./lima.yaml.template)). Use a
 ```bash
 agent-vm -t docker                         # lima-docker.yaml.template
 agent-vm -t codex                          # lima-codex.yaml.template
+agent-vm -t codex --allow-domain docs.example.com
 agent-vm --template lima-docker.yaml.template
 agent-vm -t custom                         # lima-custom.yaml.template (local only)
 agent-vm -t /path/to/my.yaml               # any Lima YAML
@@ -131,26 +134,67 @@ Alpine Linux 3.23 with:
 
 ### Docker template (`agent-vm -t docker`)
 
-Same stack as the default, plus Docker Engine and Compose. Uses 6 GiB RAM and 30 GiB disk so image pulls don’t fill the VM immediately.
+Same stack as the default, plus rootless Docker Engine and Compose. Uses 6 GiB RAM and 30 GiB disk so image pulls don’t fill the VM immediately.
 
 | Tool | Purpose |
 |------|---------|
-| Docker Engine | Containers inside the VM (`docker` CLI + daemon) |
+| Rootless Docker Engine | User-namespaced containers inside the VM |
 | Docker Compose | `docker compose` via `docker-cli-compose` |
 
-The lima user is added to the `docker` group (no sudo needed for normal use).
+Docker runs entirely as the login user. There is no root daemon, Docker group,
+or reachable `/var/run/docker.sock`, and interactive passwordless sudo is
+removed after provisioning. `docker` and `docker compose` remain approval-free.
+Host-level privileged containers and the host network namespace are not
+available; flags such as `--privileged` or `--network host` remain scoped to
+rootless Docker's user/network namespaces.
 
 ### Codex template (`agent-vm -t codex`)
 
 The public [`lima-codex.yaml.template`](./lima-codex.yaml.template) includes
-[Codex CLI](https://learn.chatgpt.com/docs/codex/cli), Docker Engine and
+[Codex CLI](https://learn.chatgpt.com/docs/codex/cli), rootless Docker Engine and
 Compose, Chromium, `agent-browser`, and the bundled `agent-browser` skill.
 Codex discovers the read-only skills mount at its standard admin location,
 `/etc/codex/skills`.
 
-The guest user belongs to the `docker` group, and Codex defaults to full access
-with no approval prompts. It can run `docker` and `docker compose` autonomously.
-The VM—not Codex's process sandbox—is the isolation boundary.
+Codex uses `approval_policy = "never"` and `sandbox_mode =
+"danger-full-access"` inside the non-root VM user account. Codex 0.153.4 blocks
+Docker Unix sockets in `workspace-write` even when explicitly allowlisted, so
+the VM—not Codex's local filesystem sandbox—is the security boundary. Codex's
+experimental native network proxy still provides a matching domain allowlist.
+A user-owned Unix bridge under `/tmp` connects the Docker CLI to the rootless
+daemon's private runtime socket. Docker pull traffic is independently
+constrained by the VM's root-owned OS egress boundary.
+
+#### Restricted egress
+
+Both Docker-bearing templates are default-deny:
+
+- A root-owned nftables policy blocks direct IPv4, IPv6, DNS, LAN,
+  `host.lima.internal`, and internet access from the login user.
+- npm, rootless Docker, builds, and containers use an SSH-tunnelled host
+  allowlist proxy. Only HTTPS `CONNECT` on port 443 is supported.
+- Built-in destinations are Codex/OpenAI control-plane hosts,
+  `registry.npmjs.org`, Docker Hub authentication/registry hosts, and Docker's
+  production image CDNs.
+- IP literals, private/link-local destinations, plain HTTP forwarding, and
+  every unlisted hostname are rejected.
+
+Some npm packages download binaries or source from other hosts in install
+scripts. Review the destination, then allow its exact hostname for one session:
+
+```bash
+agent-vm -t codex --allow-domain releases.example.com
+# Repeat --allow-domain for multiple exact hostnames.
+```
+
+The override is validated, applies to Codex's native policy and the outer
+proxy, and disappears when the shell exits. It is never written to a template.
+`agent-browser` similarly needs a reviewed override for each external site;
+guest-local development servers remain reachable.
+
+This is an egress reduction boundary, not data-loss prevention. npm and Docker
+Hub host untrusted public content and remain possible limited exfiltration
+channels. Package lockfiles, image digests, and dependency review still matter.
 
 #### Codex credentials stay ephemeral
 
@@ -158,18 +202,20 @@ The Codex template is safe to publish because it contains no credentials:
 
 1. On entry, `agent-vm` looks for `${CODEX_HOME:-~/.codex}/auth.json` on the
    Mac and streams it over Lima's SSH connection.
-2. The copy exists only under the VM's memory-backed `/dev/shm`; it is never
-   baked into the template, mounted from the host, or written to the VM disk.
+2. The copy exists only in a root-mounted tmpfs at the guest's `~/.codex`; it
+   is never baked into the template, mounted from the host, or written to the
+   VM disk. Using the normal path also lets Codex expose its generated network
+   proxy CA bundle safely to sandboxed package managers.
 3. On shell exit, the copy is deleted and the VM is stopped. Any token refresh
    remains in the ephemeral copy and is never synchronized back to the Mac.
 
 This follows Codex's documented
 [headless-host authentication pattern](https://learn.chatgpt.com/docs/auth#login-on-headless-devices)
-while eliminating credential persistence. Because Codex has full guest access,
-it—and any command or container it launches—can read the ephemeral credential
+while eliminating credential persistence. Codex itself—and a container it
+deliberately mounts the credential into—can read the ephemeral credential
 during the active session. Hiding a guest-resident credential is incompatible
-with autonomous root-equivalent Docker access. The host credential file remains
-the source of truth and is never modified by the VM.
+with autonomous operation. The host credential file remains the source of
+truth and is never modified by the VM.
 
 If the host uses keyring-only storage, no `auth.json` is available to copy; run
 `codex login --device-auth` inside the VM for that session, or configure
@@ -218,7 +264,9 @@ Key sections:
 
 ## LLM API keys
 
-VMs are on your local network. LAN IPs work directly. For servers running on your Mac, use `host.lima.internal` from inside the VM.
+The default template can reach the local network; use `host.lima.internal` for
+servers on your Mac. The Docker and Codex templates deny LAN and
+`host.lima.internal` access by design.
 
 ## License
 

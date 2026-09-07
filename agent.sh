@@ -16,6 +16,7 @@ set -e
 
 VM_PREFIX="agent"
 TEMPLATE_ARG=""
+ALLOW_DOMAINS=()
 PI_BROKER_GUEST_PORT=43111
 PI_BROKER_SCRIPT=""
 BROKER_PID=""
@@ -28,7 +29,13 @@ OPENCODE_BROKER_PID=""
 OPENCODE_BROKER_PORT=""
 OPENCODE_BROKER_READY_FILE=""
 OPENCODE_BROKER_LOG_FILE=""
-CODEX_AUTH_GUEST_DIR="/dev/shm/agent-vm-codex"
+CODEX_AUTH_GUEST_DIR=".codex"
+EGRESS_PROXY_GUEST_PORT=43113
+EGRESS_PROXY_SCRIPT=""
+EGRESS_PROXY_PID=""
+EGRESS_PROXY_PORT=""
+EGRESS_PROXY_READY_FILE=""
+EGRESS_PROXY_LOG_FILE=""
 
 # Resolve real script location (follows symlinks)
 SOURCE="$0"
@@ -41,6 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 DEFAULT_TEMPLATE="$SCRIPT_DIR/lima.yaml.template"
 PI_BROKER_SCRIPT="$SCRIPT_DIR/pi-credential-broker.mjs"
 OPENCODE_BROKER_SCRIPT="$SCRIPT_DIR/opencode-credential-broker.mjs"
+EGRESS_PROXY_SCRIPT="$SCRIPT_DIR/codex-egress-proxy.mjs"
 
 # --- Arg parsing (global flags) ---
 
@@ -57,6 +65,18 @@ while [ $# -gt 0 ]; do
       ;;
     --template=*)
       TEMPLATE_ARG="${1#*=}"
+      shift
+      ;;
+    --allow-domain)
+      if [ -z "${2:-}" ]; then
+        echo "error: $1 requires a hostname" >&2
+        exit 1
+      fi
+      ALLOW_DOMAINS+=("$2")
+      shift 2
+      ;;
+    --allow-domain=*)
+      ALLOW_DOMAINS+=("${1#*=}")
       shift
       ;;
     -h|--help)
@@ -187,6 +207,16 @@ vm_uses_codex_auth() {
     | jq -e "select(.name==\"${name}\") | .config.env.AGENT_VM_CODEX_AUTH == \"1\"" >/dev/null 2>&1
 }
 
+template_uses_restricted_egress() {
+  grep -q '^# agent-vm: restricted-egress$' "$TEMPLATE"
+}
+
+vm_uses_restricted_egress() {
+  local name="$1"
+  limactl list --json 2>/dev/null \
+    | jq -e "select(.name==\"${name}\") | .config.env.AGENT_VM_RESTRICTED_EGRESS == \"1\"" >/dev/null 2>&1
+}
+
 host_codex_auth_path() {
   echo "${CODEX_HOME:-$HOME/.codex}/auth.json"
 }
@@ -196,15 +226,41 @@ inject_codex_auth() {
   local source_path="$2"
 
   ssh -q -F "$HOME/.lima/${name}/ssh.config" -o BatchMode=yes "lima-${name}" -- \
-    "umask 077; mkdir -p '${CODEX_AUTH_GUEST_DIR}'; chmod 700 '${CODEX_AUTH_GUEST_DIR}'; cat > '${CODEX_AUTH_GUEST_DIR}/auth.json'; chmod 600 '${CODEX_AUTH_GUEST_DIR}/auth.json'" \
+    "umask 077; guest_codex_home=\"\$HOME/${CODEX_AUTH_GUEST_DIR}\"; mkdir -p \"\$guest_codex_home\"; chmod 700 \"\$guest_codex_home\"; cat > \"\$guest_codex_home/auth.json\"; chmod 600 \"\$guest_codex_home/auth.json\"" \
     < "$source_path"
+}
+
+configure_codex_session() {
+  local name="$1"
+  local overrides
+  overrides=$(mktemp "${TMPDIR:-/tmp}/agent-vm-codex-domains.XXXXXX")
+  chmod 600 "$overrides"
+
+  local domain lower_domain line
+  for domain in "${ALLOW_DOMAINS[@]}"; do
+    lower_domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+    case "$lower_domain" in
+      registry.npmjs.org|localhost) continue ;;
+    esac
+    line="\"${lower_domain}\" = \"allow\""
+    grep -Fqx "$line" "$overrides" 2>/dev/null || printf '%s\n' "$line" >> "$overrides"
+  done
+
+  if ! ssh -q -F "$HOME/.lima/${name}/ssh.config" -o BatchMode=yes "lima-${name}" -- \
+    "umask 077; guest_codex_home=\"\$HOME/${CODEX_AUTH_GUEST_DIR}\"; rm -f \"\$guest_codex_home/config.toml\"; cp /etc/codex/config.toml \"\$guest_codex_home/config.toml\"; cat >> \"\$guest_codex_home/config.toml\"; chmod 600 \"\$guest_codex_home/config.toml\"" \
+    < "$overrides"
+  then
+    rm -f "$overrides"
+    return 1
+  fi
+  rm -f "$overrides"
 }
 
 clear_codex_auth() {
   local name="$1"
   [ "$(vm_status "$name")" = "Running" ] || return 0
   ssh -q -F "$HOME/.lima/${name}/ssh.config" -o BatchMode=yes "lima-${name}" -- \
-    "rm -f '${CODEX_AUTH_GUEST_DIR}/auth.json'" >/dev/null 2>&1 || true
+    "rm -f \"\$HOME/${CODEX_AUTH_GUEST_DIR}/auth.json\" \"\$HOME/${CODEX_AUTH_GUEST_DIR}/config.toml\"" >/dev/null 2>&1 || true
 }
 
 prepare_pi_config() {
@@ -409,6 +465,38 @@ start_opencode_broker() {
   OPENCODE_BROKER_PORT=$(jq -er '.port' "$OPENCODE_BROKER_READY_FILE")
 }
 
+start_egress_proxy() {
+  local runtime_root="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+  EGRESS_PROXY_READY_FILE=$(mktemp "$runtime_root/agent-vm-egress-ready.XXXXXX")
+  EGRESS_PROXY_LOG_FILE=$(mktemp "$runtime_root/agent-vm-egress-log.XXXXXX")
+
+  local proxy_args=()
+  local domain
+  for domain in "${ALLOW_DOMAINS[@]}"; do
+    proxy_args+=(--allow-domain "$domain")
+  done
+
+  node "$EGRESS_PROXY_SCRIPT" "${proxy_args[@]}" >"$EGRESS_PROXY_READY_FILE" 2>"$EGRESS_PROXY_LOG_FILE" &
+  EGRESS_PROXY_PID=$!
+
+  local attempts=0
+  while [ ! -s "$EGRESS_PROXY_READY_FILE" ]; do
+    if ! kill -0 "$EGRESS_PROXY_PID" 2>/dev/null; then
+      echo "error: egress allowlist proxy failed to start" >&2
+      cat "$EGRESS_PROXY_LOG_FILE" >&2
+      return 1
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 100 ]; then
+      echo "error: timed out waiting for egress allowlist proxy" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+
+  EGRESS_PROXY_PORT=$(jq -er '.port' "$EGRESS_PROXY_READY_FILE")
+}
+
 stop_pi_broker() {
   if [ -n "$BROKER_PID" ] && kill -0 "$BROKER_PID" 2>/dev/null; then
     kill "$BROKER_PID" 2>/dev/null || true
@@ -429,9 +517,20 @@ stop_opencode_broker() {
   OPENCODE_BROKER_PID=""
 }
 
+stop_egress_proxy() {
+  if [ -n "$EGRESS_PROXY_PID" ] && kill -0 "$EGRESS_PROXY_PID" 2>/dev/null; then
+    kill "$EGRESS_PROXY_PID" 2>/dev/null || true
+    wait "$EGRESS_PROXY_PID" 2>/dev/null || true
+  fi
+  [ -z "$EGRESS_PROXY_READY_FILE" ] || rm -f "$EGRESS_PROXY_READY_FILE"
+  [ -z "$EGRESS_PROXY_LOG_FILE" ] || rm -f "$EGRESS_PROXY_LOG_FILE"
+  EGRESS_PROXY_PID=""
+}
+
 stop_brokers() {
   stop_pi_broker
   stop_opencode_broker
+  stop_egress_proxy
 }
 
 stop_vm_verified() {
@@ -465,6 +564,7 @@ cmd_shell() {
   local use_pi_broker=false
   local use_opencode_broker=false
   local use_codex_auth=false
+  local use_restricted_egress=false
   local pi_config_path=""
   local opencode_config_path=""
   local codex_auth_path=""
@@ -474,10 +574,17 @@ cmd_shell() {
     vm_uses_pi_broker "$vm_name" && use_pi_broker=true
     vm_uses_opencode_broker "$vm_name" && use_opencode_broker=true
     vm_uses_codex_auth "$vm_name" && use_codex_auth=true
+    vm_uses_restricted_egress "$vm_name" && use_restricted_egress=true
   else
     template_uses_pi_broker && use_pi_broker=true
     template_uses_opencode_broker && use_opencode_broker=true
     template_uses_codex_auth && use_codex_auth=true
+    template_uses_restricted_egress && use_restricted_egress=true
+  fi
+
+  if [ ${#ALLOW_DOMAINS[@]} -gt 0 ] && [ "$use_restricted_egress" != true ]; then
+    echo "error: --allow-domain requires a restricted-egress Docker template" >&2
+    exit 1
   fi
 
   if [ "$use_pi_broker" = true ]; then
@@ -557,7 +664,9 @@ cmd_shell() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  local ssh_args=(-qt -F "$HOME/.lima/${vm_name}/ssh.config")
+  # Keep forwards attached to this shell instead of Lima's persistent
+  # ControlMaster, so no stale proxy target survives session cleanup.
+  local ssh_args=(-qt -o ControlMaster=no -o ControlPath=none -F "$HOME/.lima/${vm_name}/ssh.config")
   local remote_cmd='cd /workspace; exec bash --login'
 
   if [ "$use_codex_auth" = true ]; then
@@ -573,8 +682,29 @@ cmd_shell() {
     fi
   fi
 
-  if [ "$use_pi_broker" = true ] || [ "$start_opencode_tunnel" = true ]; then
+  if [ "$use_pi_broker" = true ] || [ "$start_opencode_tunnel" = true ] || [ "$use_restricted_egress" = true ]; then
     ssh_args+=(-o ExitOnForwardFailure=yes)
+  fi
+
+  if [ "$use_restricted_egress" = true ]; then
+    if [ ! -f "$EGRESS_PROXY_SCRIPT" ]; then
+      echo "error: missing egress allowlist proxy: ${EGRESS_PROXY_SCRIPT}" >&2
+      return 1
+    fi
+    start_egress_proxy
+    ssh_args+=(-R "127.0.0.1:${EGRESS_PROXY_GUEST_PORT}:127.0.0.1:${EGRESS_PROXY_PORT}")
+    ssh_args+=(-R "agent-vm-egress.internal:${EGRESS_PROXY_GUEST_PORT}:127.0.0.1:${EGRESS_PROXY_PORT}")
+    if [ "$use_codex_auth" = true ]; then
+      if ! configure_codex_session "$vm_name"; then
+        echo "error: failed to configure the Codex network allowlist in ${vm_name}" >&2
+        return 1
+      fi
+    fi
+    remote_cmd="agent-vm-start-docker; ${remote_cmd}"
+    echo "  Network: npm, Docker Hub, and agent API endpoints only"
+    if [ ${#ALLOW_DOMAINS[@]} -gt 0 ]; then
+      echo "  Extra domains: ${ALLOW_DOMAINS[*]}"
+    fi
   fi
 
   if [ "$use_pi_broker" = true ]; then
@@ -693,6 +823,8 @@ cmd_help() {
   echo "  agent-vm              Enter VM for current directory (creates on first run)"
   echo "  agent-vm -t docker    Create with Docker template (first run only)"
   echo "  agent-vm -t codex     Create with autonomous Codex, Docker, and ephemeral auth"
+  echo "  agent-vm --allow-domain HOST"
+  echo "                        Allow one extra HTTPS hostname for this session"
   echo "  agent-vm -t custom    Create with local custom template (first run only)"
   echo "  agent-vm list         Show all agent VMs and their status"
   echo "  agent-vm status       Show VM for current directory"
@@ -705,6 +837,7 @@ cmd_help() {
   echo "                        Shorthand: docker → lima-docker.yaml.template"
   echo "                                   codex  → lima-codex.yaml.template"
   echo "                                   custom → lima-custom.yaml.template"
+  echo "  --allow-domain HOST   Repeatable; restricted Docker templates only"
   echo ""
   echo "Each project gets its own VM and stops when its shell exits."
   echo "~4 GB RAM per default VM; Docker template uses ~6 GB + 30 GiB disk."

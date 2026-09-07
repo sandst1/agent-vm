@@ -1,5 +1,6 @@
 # Codex agent VM with Docker — Alpine Linux
 # agent-vm: codex-auth
+# agent-vm: restricted-egress
 #
 # Public template for Codex CLI, Docker, Chromium, and agent-browser:
 #
@@ -23,15 +24,13 @@ images:
   - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
     arch: x86_64
 
-networks:
-  - vzNAT: true
-
 containerd:
   system: false
   user: false
 
 env:
   AGENT_VM_CODEX_AUTH: "1"
+  AGENT_VM_RESTRICTED_EGRESS: "1"
 
 mounts:
   # The selected project is the only host directory exposed to the VM.
@@ -58,68 +57,222 @@ provision:
         build-base \
         chromium \
         curl \
-        docker \
         docker-cli \
         docker-cli-compose \
+        docker-rootless-extras \
+        docker-rootless-extras-openrc \
         fd \
         font-noto \
         font-noto-emoji \
         git \
         jq \
         nodejs \
+        nftables \
         npm \
         py3-pip \
         python3 \
         ripgrep \
+        shadow-subids \
+        socat \
         tmux \
         unzip
 
-      rc-update add docker default
-      service docker start
+      # Rootless Docker prerequisites. The login user already exists when Lima
+      # runs system provisioning.
+      agent_user="{{USER}}"
+      [ -n "$agent_user" ]
+      agent_uid="$(id -u "$agent_user")"
+      agent_gid="$(id -g "$agent_user")"
+      guest_ip="$(ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+      [ -n "$guest_ip" ]
 
-      # Full Docker access is intentional: the VM is the sandbox.
-      for d in /home/*; do
-        [ -d "$d" ] || continue
-        addgroup "$(basename "$d")" docker || true
+      sed -i '/[[:space:]]agent-vm-egress\.internal$/d' /etc/hosts
+      echo "${guest_ip} agent-vm-egress.internal" >> /etc/hosts
+      mkdir -p /etc/ssh/sshd_config.d
+      cat > /etc/ssh/sshd_config.d/90-agent-vm-egress.conf << 'SSHD'
+      GatewayPorts clientspecified
+      SSHD
+      rc-service sshd reload
+
+      grep -q "^${agent_user}:" /etc/subuid 2>/dev/null \
+        || echo "${agent_user}:100000:65536" >> /etc/subuid
+      grep -q "^${agent_user}:" /etc/subgid 2>/dev/null \
+        || echo "${agent_user}:100000:65536" >> /etc/subgid
+
+      if grep -q '^rc_cgroup_mode=' /etc/rc.conf; then
+        sed -i 's/^rc_cgroup_mode=.*/rc_cgroup_mode="unified"/' /etc/rc.conf
+      else
+        echo 'rc_cgroup_mode="unified"' >> /etc/rc.conf
+      fi
+      rc-update add cgroups default
+      service cgroups start || true
+
+      install -d -m 700 -o "$agent_uid" -g "$agent_gid" "/run/user/${agent_uid}"
+
+      # Only the login user's direct IP egress is denied. Root-owned system
+      # services and Lima provisioning remain functional. HTTPS exits through
+      # the host allowlist proxy over the SSH loopback tunnel.
+      cat > /etc/nftables.nft << NFT
+      table inet agent_vm_egress {
+        chain output {
+          type filter hook output priority 0; policy accept;
+          ct state established,related accept
+          meta skuid ${agent_uid} ip daddr 127.0.0.0/8 accept
+          meta skuid ${agent_uid} ip6 daddr ::1 accept
+          ip daddr ${guest_ip} tcp dport 43113 accept
+          meta skuid ${agent_uid} reject
+          meta skuid 100000-165535 reject
+        }
+        chain forward {
+          type filter hook forward priority 0; policy drop;
+        }
+      }
+      NFT
+      rc-update add nftables default
+
+      cat > /usr/local/bin/agent-vm-start-docker << 'DOCKER_START'
+      #!/bin/sh
+      set -eu
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+      docker_socket="${XDG_RUNTIME_DIR}/docker.sock"
+      export DOCKER_HOST="unix://${docker_socket}"
+
+      if ! docker info >/dev/null 2>&1; then
+        mkdir -p "$XDG_RUNTIME_DIR" "$HOME/.local/state"
+        chmod 700 "$XDG_RUNTIME_DIR"
+        export HTTP_PROXY="http://agent-vm-egress.internal:43113"
+        export HTTPS_PROXY="$HTTP_PROXY"
+        export http_proxy="$HTTP_PROXY"
+        export https_proxy="$HTTP_PROXY"
+        export NO_PROXY="127.0.0.1,localhost"
+        export no_proxy="$NO_PROXY"
+        export DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
+        export DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=true
+
+        nohup dockerd-rootless --host="$DOCKER_HOST" \
+          >"$HOME/.local/state/dockerd-rootless.log" 2>&1 </dev/null &
+
+        attempts=0
+        until docker info >/dev/null 2>&1; do
+          attempts=$((attempts + 1))
+          if [ "$attempts" -ge 100 ]; then
+            echo "rootless Docker failed to start" >&2
+            tail -n 50 "$HOME/.local/state/dockerd-rootless.log" >&2 || true
+            exit 1
+          fi
+          sleep 0.1
+        done
+      fi
+
+      docker_bridge="/tmp/agent-vm-docker.sock"
+      if ! docker -H "unix://${docker_bridge}" info >/dev/null 2>&1; then
+        rm -f "$docker_bridge"
+        nohup socat "UNIX-LISTEN:${docker_bridge},mode=600,fork" \
+          "UNIX-CONNECT:${docker_socket}" \
+          >"$HOME/.local/state/docker-bridge.log" 2>&1 </dev/null &
+      fi
+
+      export DOCKER_HOST="unix://${docker_bridge}"
+      attempts=0
+      until docker info >/dev/null 2>&1; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 50 ] || {
+          echo "rootless Docker bridge failed to start" >&2
+          exit 1
+        }
+        sleep 0.1
       done
+      DOCKER_START
+      chmod 755 /usr/local/bin/agent-vm-start-docker
 
       npm install -g @openai/codex agent-browser
 
       cat > /etc/profile.d/agent-vm-codex.sh << 'PROFILE'
-      export CODEX_HOME=/dev/shm/agent-vm-codex
+      export CODEX_HOME="$HOME/.codex"
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+      export DOCKER_HOST="unix:///tmp/agent-vm-docker.sock"
+      export HTTP_PROXY="http://127.0.0.1:43113"
+      export HTTPS_PROXY="$HTTP_PROXY"
+      export http_proxy="$HTTP_PROXY"
+      export https_proxy="$HTTP_PROXY"
+      export NO_PROXY="127.0.0.1,localhost"
+      export no_proxy="$NO_PROXY"
       export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser
       export AGENT_BROWSER_ARGS="--no-sandbox,--disable-gpu,--disable-dev-shm-usage"
       PROFILE
       chmod +x /etc/profile.d/agent-vm-codex.sh
 
-      # Codex runs autonomously because the VM itself is the isolation boundary.
-      # Credentials remain ephemeral, but a fully privileged guest can access
-      # them while the session is active.
+      # Codex stays approval-free inside the non-root guest boundary.
       mkdir -p /etc/codex
-      cat > /etc/codex/config.toml << 'CONFIG'
+      cat > /etc/codex/config.toml << CONFIG
       cli_auth_credentials_store = "file"
       approval_policy = "never"
-      default_permissions = ":danger-full-access"
+      sandbox_mode = "danger-full-access"
 
-      [shell_environment_policy]
-      ignore_default_excludes = false
+      [features.network_proxy]
+      enabled = true
+      allow_local_binding = true
+
+      [features.network_proxy.unix_sockets]
+      "/tmp/agent-vm-docker.sock" = "allow"
+
+      [features.network_proxy.domains]
+      "registry.npmjs.org" = "allow"
+      "localhost" = "allow"
+      "127.0.0.1" = "allow"
       CONFIG
 
       touch /etc/agent-vm-codex-provisioned
+
+  # Recreate runtime state on every boot. After first-boot user setup, enforce
+  # the firewall and remove Lima's blanket interactive sudo grant before login.
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eux
+      agent_user="{{USER}}"
+      agent_uid="$(id -u "$agent_user")"
+      agent_gid="$(id -g "$agent_user")"
+      agent_home="$(getent passwd "$agent_user" | cut -d: -f6)"
+      install -d -m 700 -o "$agent_uid" -g "$agent_gid" "/run/user/${agent_uid}"
+      install -d -m 700 -o "$agent_uid" -g "$agent_gid" "$agent_home/.codex"
+      if ! mountpoint -q "$agent_home/.codex"; then
+        mount -t tmpfs -o "mode=700,uid=${agent_uid},gid=${agent_gid},size=128m" \
+          codex-home "$agent_home/.codex"
+      fi
+      if [ -f "$agent_home/.agent-vm-codex-user-provisioned" ]; then
+        nft delete table inet agent_vm_egress 2>/dev/null || true
+        nft -f /etc/nftables.nft
+        rm -f /etc/sudoers.d/90-lima-users
+      fi
 
   - mode: user
     script: |
       #!/bin/sh
       set -eux
 
-      ln -sfn /workspace ~/project
-      ln -sfn /workspace ~/p
+      first_boot=false
+      if [ ! -f ~/.agent-vm-codex-user-provisioned ]; then
+        first_boot=true
+        ln -sfn /workspace ~/project
+        ln -sfn /workspace ~/p
 
-      # Ensure passwordless Docker even if /home did not exist during system
-      # provisioning. Lima users have passwordless sudo for this setup step.
-      sudo addgroup "$(id -un)" docker || true
+        npm config set proxy http://127.0.0.1:43113
+        npm config set https-proxy http://127.0.0.1:43113
 
-      # /dev/shm is tmpfs. Recreate this private directory on every VM start;
-      # agent-vm copies auth.json into it immediately before opening the shell.
-      mkdir -p /dev/shm/agent-vm-codex
-      chmod 700 /dev/shm/agent-vm-codex
+        mkdir -p ~/.docker
+        guest_ip="$(getent hosts agent-vm-egress.internal | awk 'NR == 1 { print $1 }')"
+        printf '%s\n' "{\"proxies\":{\"default\":{\"httpProxy\":\"http://${guest_ip}:43113\",\"httpsProxy\":\"http://${guest_ip}:43113\",\"noProxy\":\"127.0.0.1,localhost\"}}}" > ~/.docker/config.json
+        chmod 600 ~/.docker/config.json
+        touch ~/.agent-vm-codex-user-provisioned
+      fi
+
+      # The root-mounted ~/.codex tmpfs is recreated on every VM start.
+      # agent-vm copies auth.json into it before opening the shell.
+      mkdir -p ~/.codex
+      chmod 700 ~/.codex
+
+      if [ "$first_boot" = true ]; then
+        sudo nft -f /etc/nftables.nft
+        sudo rm -f /etc/sudoers.d/90-lima-users
+      fi
