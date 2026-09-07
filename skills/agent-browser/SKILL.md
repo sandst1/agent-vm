@@ -25,7 +25,7 @@ Browser automation CLI. Headless Chromium is available in this VM.
 
 ## Long-running servers (Vite, etc.)
 
-OpenCode’s bash tool kills background jobs when the shell ends. Do **not** use `&`, `nohup`, or `disown` for dev servers. Use **tmux** instead.
+Agent shell commands may kill background jobs when the command ends. Do **not** use `&`, `nohup`, or `disown` for dev servers. Use **tmux** instead.
 
 **Start** (idempotent):
 

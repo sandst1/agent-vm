@@ -1,0 +1,125 @@
+# Codex agent VM with Docker — Alpine Linux
+# agent-vm: codex-auth
+#
+# Public template for Codex CLI, Docker, Chromium, and agent-browser:
+#
+#   agent-vm -t codex
+#
+# Codex credentials are injected by agent-vm into a memory-backed CODEX_HOME.
+# They are not baked into this template or mounted from the host.
+# {{PROJECT_PATH}} and {{SCRIPT_DIR}} are substituted at runtime.
+
+vmType: vz
+os: Linux
+arch: default
+
+cpus: 2
+memory: 6GiB
+disk: 30GiB
+
+images:
+  - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-aarch64-uefi-cloudinit-r0.qcow2"
+    arch: aarch64
+  - location: "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/cloud/nocloud_alpine-3.23.4-x86_64-uefi-cloudinit-r0.qcow2"
+    arch: x86_64
+
+networks:
+  - vzNAT: true
+
+containerd:
+  system: false
+  user: false
+
+env:
+  AGENT_VM_CODEX_AUTH: "1"
+
+mounts:
+  # The selected project is the only host directory exposed to the VM.
+  - location: "{{PROJECT_PATH}}"
+    writable: true
+    mountPoint: "/workspace"
+
+  # Codex discovers admin skills here. This includes agent-browser.
+  - location: "{{SCRIPT_DIR}}/skills"
+    writable: false
+    mountPoint: "/etc/codex/skills"
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eux
+      [ -f /etc/agent-vm-codex-provisioned ] && exit 0
+
+      apk update
+      apk add \
+        bash \
+        bubblewrap \
+        build-base \
+        chromium \
+        curl \
+        docker \
+        docker-cli \
+        docker-cli-compose \
+        fd \
+        font-noto \
+        font-noto-emoji \
+        git \
+        jq \
+        nodejs \
+        npm \
+        py3-pip \
+        python3 \
+        ripgrep \
+        tmux \
+        unzip
+
+      rc-update add docker default
+      service docker start
+
+      # Full Docker access is intentional: the VM is the sandbox.
+      for d in /home/*; do
+        [ -d "$d" ] || continue
+        addgroup "$(basename "$d")" docker || true
+      done
+
+      npm install -g @openai/codex agent-browser
+
+      cat > /etc/profile.d/agent-vm-codex.sh << 'PROFILE'
+      export CODEX_HOME=/dev/shm/agent-vm-codex
+      export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+      export AGENT_BROWSER_ARGS="--no-sandbox,--disable-gpu,--disable-dev-shm-usage"
+      PROFILE
+      chmod +x /etc/profile.d/agent-vm-codex.sh
+
+      # Codex runs autonomously because the VM itself is the isolation boundary.
+      # Credentials remain ephemeral, but a fully privileged guest can access
+      # them while the session is active.
+      mkdir -p /etc/codex
+      cat > /etc/codex/config.toml << 'CONFIG'
+      cli_auth_credentials_store = "file"
+      approval_policy = "never"
+      default_permissions = ":danger-full-access"
+
+      [shell_environment_policy]
+      ignore_default_excludes = false
+      CONFIG
+
+      touch /etc/agent-vm-codex-provisioned
+
+  - mode: user
+    script: |
+      #!/bin/sh
+      set -eux
+
+      ln -sfn /workspace ~/project
+      ln -sfn /workspace ~/p
+
+      # Ensure passwordless Docker even if /home did not exist during system
+      # provisioning. Lima users have passwordless sudo for this setup step.
+      sudo addgroup "$(id -un)" docker || true
+
+      # /dev/shm is tmpfs. Recreate this private directory on every VM start;
+      # agent-vm copies auth.json into it immediately before opening the shell.
+      mkdir -p /dev/shm/agent-vm-codex
+      chmod 700 /dev/shm/agent-vm-codex

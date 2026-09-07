@@ -65,6 +65,7 @@ When you're done, `exit` the VM shell. agent-vm closes its SSH forwards and stop
 ```
 agent-vm              Enter VM for current directory (creates on first run)
 agent-vm -t docker    Create with the Docker template (first run only)
+agent-vm -t codex     Create with the Codex + Docker template (first run only)
 agent-vm -t custom    Create with your local custom template (first run only)
 agent-vm list         Show all agent VMs and their status
 agent-vm status       Show VM for current directory
@@ -81,6 +82,7 @@ The default VM stays light ([`lima.yaml.template`](./lima.yaml.template)). Use a
 
 ```bash
 agent-vm -t docker                         # lima-docker.yaml.template
+agent-vm -t codex                          # lima-codex.yaml.template
 agent-vm --template lima-docker.yaml.template
 agent-vm -t custom                         # lima-custom.yaml.template (local only)
 agent-vm -t /path/to/my.yaml               # any Lima YAML
@@ -138,6 +140,41 @@ Same stack as the default, plus Docker Engine and Compose. Uses 6 GiB RAM and 
 
 The lima user is added to the `docker` group (no sudo needed for normal use).
 
+### Codex template (`agent-vm -t codex`)
+
+The public [`lima-codex.yaml.template`](./lima-codex.yaml.template) includes
+[Codex CLI](https://learn.chatgpt.com/docs/codex/cli), Docker Engine and
+Compose, Chromium, `agent-browser`, and the bundled `agent-browser` skill.
+Codex discovers the read-only skills mount at its standard admin location,
+`/etc/codex/skills`.
+
+The guest user belongs to the `docker` group, and Codex defaults to full access
+with no approval prompts. It can run `docker` and `docker compose` autonomously.
+The VM—not Codex's process sandbox—is the isolation boundary.
+
+#### Codex credentials stay ephemeral
+
+The Codex template is safe to publish because it contains no credentials:
+
+1. On entry, `agent-vm` looks for `${CODEX_HOME:-~/.codex}/auth.json` on the
+   Mac and streams it over Lima's SSH connection.
+2. The copy exists only under the VM's memory-backed `/dev/shm`; it is never
+   baked into the template, mounted from the host, or written to the VM disk.
+3. On shell exit, the copy is deleted and the VM is stopped. Any token refresh
+   remains in the ephemeral copy and is never synchronized back to the Mac.
+
+This follows Codex's documented
+[headless-host authentication pattern](https://learn.chatgpt.com/docs/auth#login-on-headless-devices)
+while eliminating credential persistence. Because Codex has full guest access,
+it—and any command or container it launches—can read the ephemeral credential
+during the active session. Hiding a guest-resident credential is incompatible
+with autonomous root-equivalent Docker access. The host credential file remains
+the source of truth and is never modified by the VM.
+
+If the host uses keyring-only storage, no `auth.json` is available to copy; run
+`codex login --device-auth` inside the VM for that session, or configure
+file-backed host storage first. Treat `~/.codex/auth.json` like a password.
+
 ### Custom template (`agent-vm -t custom`)
 
 Same idea as Docker, but the file lives only on your machine. Start from [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example), customize freely, and create VMs with `-t custom`. Nothing under `lima-custom.yaml.template` is committed.
@@ -165,6 +202,7 @@ Templates live next to the script:
 |------|------|
 | [`lima.yaml.template`](./lima.yaml.template) | Default (light) |
 | [`lima-docker.yaml.template`](./lima-docker.yaml.template) | `agent-vm -t docker` |
+| [`lima-codex.yaml.template`](./lima-codex.yaml.template) | `agent-vm -t codex` (Codex + Docker + ephemeral auth) |
 | [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example) | Starter for local custom (copy → `lima-custom.yaml.template`) |
 | `lima-custom.yaml.template` | `agent-vm -t custom` (gitignored; create locally) |
 

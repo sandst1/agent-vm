@@ -7,6 +7,7 @@
 #   cd ~/projects/customer-a && agent-vm       # creates/enters VM
 #   cd ~/projects/customer-b && agent-vm       # separate VM
 #   agent-vm -t docker                         # create with Docker template
+#   agent-vm -t codex                          # create with Codex + Docker template
 #   agent-vm -t custom                         # create with local custom template
 #   agent-vm list                              # see all VMs
 #   agent-vm stop customer-a                   # free the RAM
@@ -27,6 +28,7 @@ OPENCODE_BROKER_PID=""
 OPENCODE_BROKER_PORT=""
 OPENCODE_BROKER_READY_FILE=""
 OPENCODE_BROKER_LOG_FILE=""
+CODEX_AUTH_GUEST_DIR="/dev/shm/agent-vm-codex"
 
 # Resolve real script location (follows symlinks)
 SOURCE="$0"
@@ -173,6 +175,36 @@ vm_uses_opencode_broker() {
   local name="$1"
   limactl list --json 2>/dev/null \
     | jq -e "select(.name==\"${name}\") | .config.env.AGENT_VM_OPENCODE_BROKER == \"1\"" >/dev/null 2>&1
+}
+
+template_uses_codex_auth() {
+  grep -q '^# agent-vm: codex-auth$' "$TEMPLATE"
+}
+
+vm_uses_codex_auth() {
+  local name="$1"
+  limactl list --json 2>/dev/null \
+    | jq -e "select(.name==\"${name}\") | .config.env.AGENT_VM_CODEX_AUTH == \"1\"" >/dev/null 2>&1
+}
+
+host_codex_auth_path() {
+  echo "${CODEX_HOME:-$HOME/.codex}/auth.json"
+}
+
+inject_codex_auth() {
+  local name="$1"
+  local source_path="$2"
+
+  ssh -q -F "$HOME/.lima/${name}/ssh.config" -o BatchMode=yes "lima-${name}" -- \
+    "umask 077; mkdir -p '${CODEX_AUTH_GUEST_DIR}'; chmod 700 '${CODEX_AUTH_GUEST_DIR}'; cat > '${CODEX_AUTH_GUEST_DIR}/auth.json'; chmod 600 '${CODEX_AUTH_GUEST_DIR}/auth.json'" \
+    < "$source_path"
+}
+
+clear_codex_auth() {
+  local name="$1"
+  [ "$(vm_status "$name")" = "Running" ] || return 0
+  ssh -q -F "$HOME/.lima/${name}/ssh.config" -o BatchMode=yes "lima-${name}" -- \
+    "rm -f '${CODEX_AUTH_GUEST_DIR}/auth.json'" >/dev/null 2>&1 || true
 }
 
 prepare_pi_config() {
@@ -432,16 +464,20 @@ cmd_shell() {
   vm_name=$(vm_name_for "$project_path")
   local use_pi_broker=false
   local use_opencode_broker=false
+  local use_codex_auth=false
   local pi_config_path=""
   local opencode_config_path=""
+  local codex_auth_path=""
   local start_opencode_tunnel=false
 
   if vm_exists "$vm_name"; then
     vm_uses_pi_broker "$vm_name" && use_pi_broker=true
     vm_uses_opencode_broker "$vm_name" && use_opencode_broker=true
+    vm_uses_codex_auth "$vm_name" && use_codex_auth=true
   else
     template_uses_pi_broker && use_pi_broker=true
     template_uses_opencode_broker && use_opencode_broker=true
+    template_uses_codex_auth && use_codex_auth=true
   fi
 
   if [ "$use_pi_broker" = true ]; then
@@ -461,6 +497,10 @@ cmd_shell() {
     if jq -e 'length > 0' "$opencode_config_path/auth.json" >/dev/null 2>&1; then
       start_opencode_tunnel=true
     fi
+  fi
+
+  if [ "$use_codex_auth" = true ]; then
+    codex_auth_path=$(host_codex_auth_path)
   fi
 
   if ! vm_exists "$vm_name"; then
@@ -505,6 +545,9 @@ cmd_shell() {
     cleanup_done=true
     trap - EXIT HUP INT TERM
     stop_brokers
+    if [ "$use_codex_auth" = true ]; then
+      clear_codex_auth "$vm_name"
+    fi
     echo "Stopping ${vm_name}..."
     stop_vm_verified "$vm_name" || true
     return "$status"
@@ -516,6 +559,19 @@ cmd_shell() {
 
   local ssh_args=(-qt -F "$HOME/.lima/${vm_name}/ssh.config")
   local remote_cmd='cd /workspace; exec bash --login'
+
+  if [ "$use_codex_auth" = true ]; then
+    if [ -r "$codex_auth_path" ]; then
+      if ! inject_codex_auth "$vm_name" "$codex_auth_path"; then
+        echo "error: failed to inject Codex credentials into ${vm_name}" >&2
+        return 1
+      fi
+      echo "  Codex auth: ephemeral session copy (host credentials remain unchanged)"
+    else
+      echo "  Codex auth: no file-based host login found at ${codex_auth_path}" >&2
+      echo "  Run 'codex login --device-auth' in the VM (the login is erased on stop)." >&2
+    fi
+  fi
 
   if [ "$use_pi_broker" = true ] || [ "$start_opencode_tunnel" = true ]; then
     ssh_args+=(-o ExitOnForwardFailure=yes)
@@ -636,6 +692,7 @@ cmd_help() {
   echo ""
   echo "  agent-vm              Enter VM for current directory (creates on first run)"
   echo "  agent-vm -t docker    Create with Docker template (first run only)"
+  echo "  agent-vm -t codex     Create with autonomous Codex, Docker, and ephemeral auth"
   echo "  agent-vm -t custom    Create with local custom template (first run only)"
   echo "  agent-vm list         Show all agent VMs and their status"
   echo "  agent-vm status       Show VM for current directory"
@@ -646,6 +703,7 @@ cmd_help() {
   echo "Templates (used only when creating a new VM):"
   echo "  -t, --template NAME   lima.yaml.template (default), docker, custom, or a path"
   echo "                        Shorthand: docker → lima-docker.yaml.template"
+  echo "                                   codex  → lima-codex.yaml.template"
   echo "                                   custom → lima-custom.yaml.template"
   echo ""
   echo "Each project gets its own VM and stops when its shell exits."
