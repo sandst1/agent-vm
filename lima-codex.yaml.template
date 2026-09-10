@@ -149,7 +149,9 @@ provision:
         export DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns
         export DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK=true
 
-        nohup dockerd-rootless --host="$DOCKER_HOST" \
+        # Detach from the SSH terminal's session so Ctrl-C in an agent does
+        # not interrupt the long-lived rootless daemon.
+        nohup setsid dockerd-rootless --host="$DOCKER_HOST" \
           >"$HOME/.local/state/dockerd-rootless.log" 2>&1 </dev/null &
 
         attempts=0
@@ -167,7 +169,9 @@ provision:
       docker_bridge="/tmp/agent-vm-docker.sock"
       if ! docker -H "unix://${docker_bridge}" info >/dev/null 2>&1; then
         rm -f "$docker_bridge"
-        nohup socat "UNIX-LISTEN:${docker_bridge},mode=600,fork" \
+        # socat otherwise remains in the login shell's process group and can
+        # lose the public Docker socket when that terminal receives SIGINT.
+        nohup setsid socat "UNIX-LISTEN:${docker_bridge},mode=600,fork" \
           "UNIX-CONNECT:${docker_socket}" \
           >"$HOME/.local/state/docker-bridge.log" 2>&1 </dev/null &
       fi
