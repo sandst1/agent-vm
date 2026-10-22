@@ -90,7 +90,15 @@ provision:
       set -eux
       [ -f ~/.agent-vm-user-provisioned ] && exit 0
 
-      curl -fsSL https://opencode.ai/install | sh
+      # The upstream installer requires Bash. Download separately so a curl
+      # failure cannot be hidden by a successful shell at the end of a pipe.
+      installer="$(mktemp)"
+      trap 'rm -f "$installer"' EXIT
+      curl -fsSL https://opencode.ai/install -o "$installer"
+      bash "$installer" --no-modify-path
+      "$HOME/.opencode/bin/opencode" --version
+      rm -f "$installer"
+      trap - EXIT
 
       git clone https://github.com/sandst1/opencode-loop.git ~/.local/share/opencode-loop
       cd ~/.local/share/opencode-loop
@@ -124,3 +132,15 @@ provision:
       done
 
       touch ~/.agent-vm-user-provisioned
+
+probes:
+  - mode: readiness
+    description: OpenCode user provisioning completed
+    script: |
+      #!/bin/sh
+      set -eu
+      test -f "$HOME/.agent-vm-user-provisioned"
+      test -x "$HOME/.opencode/bin/opencode-loop"
+      "$HOME/.opencode/bin/opencode" --version
+    hint: |
+      OpenCode provisioning failed. Inspect /var/log/cloud-init-output.log in the guest.
