@@ -1,10 +1,16 @@
-# Lightweight agent VM — Alpine Linux (default)
+# Local custom agent VM — Alpine Linux
 # agent-vm: opencode-broker
 #
-# Default template when agent-vm creates a new VM.
-# For Docker Engine + more disk/RAM, use: agent-vm -t docker
-# {{PROJECT_PATH}} and {{SCRIPT_DIR}} are substituted at runtime.
-# Edit freely: adjust CPUs/RAM/disk, add mounts, install extra packages, etc.
+# This file is a starter for a machine-local template that is NOT committed
+# to git. Setup:
+#
+#   mkdir -p ~/.config/agent-vm
+#   cp /path/to/agent-vm/templates/lima-custom.yaml.template.example ~/.config/agent-vm/my.yaml
+#   # edit ~/.config/agent-vm/my.yaml (packages, images, RAM, mounts, …)
+#   agent-vm -t ~/.config/agent-vm/my.yaml
+#
+# Keep private templates outside the repository. {{PROJECT_PATH}} and
+# {{SCRIPT_DIR}} are substituted at runtime.
 
 vmType: vz
 os: Linux
@@ -71,6 +77,8 @@ provision:
         chromium \
         font-noto \
         font-noto-emoji
+      # Add your own packages here, e.g.:
+      #   rust cargo go openjdk21
 
       npm install -g agent-browser
 

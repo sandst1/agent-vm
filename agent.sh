@@ -6,9 +6,9 @@
 #
 #   cd ~/projects/customer-a && agent-vm       # creates/enters VM
 #   cd ~/projects/customer-b && agent-vm       # separate VM
-#   agent-vm -t docker                         # create with Docker template
-#   agent-vm -t codex                          # create with Codex + Docker template
-#   agent-vm -t custom                         # create with local custom template
+#   agent-vm -t /path/to/agent-vm/templates/lima-docker.yaml.template  # create with Docker template
+#   agent-vm -t /path/to/agent-vm/templates/lima-codex.yaml.template  # create with Codex + Docker template
+#   agent-vm -t ~/.config/agent-vm/my.yaml  # create with local custom template
 #   agent-vm list                              # see all VMs
 #   agent-vm stop customer-a                   # free the RAM
 
@@ -45,7 +45,7 @@ while [ -L "$SOURCE" ]; do
   [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
-DEFAULT_TEMPLATE="$SCRIPT_DIR/lima.yaml.template"
+DEFAULT_TEMPLATE="$SCRIPT_DIR/templates/lima.yaml.template"
 PI_BROKER_SCRIPT="$SCRIPT_DIR/pi-credential-broker.mjs"
 OPENCODE_BROKER_SCRIPT="$SCRIPT_DIR/opencode-credential-broker.mjs"
 EGRESS_PROXY_SCRIPT="$SCRIPT_DIR/codex-egress-proxy.mjs"
@@ -57,7 +57,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -t|--template)
       if [ -z "${2:-}" ]; then
-        echo "error: $1 requires a template name or path" >&2
+        echo "error: $1 requires a template file path" >&2
         exit 1
       fi
       TEMPLATE_ARG="$2"
@@ -65,6 +65,10 @@ while [ $# -gt 0 ]; do
       ;;
     --template=*)
       TEMPLATE_ARG="${1#*=}"
+      if [ -z "$TEMPLATE_ARG" ]; then
+        echo "error: --template requires a template file path" >&2
+        exit 1
+      fi
       shift
       ;;
     --allow-domain)
@@ -99,43 +103,15 @@ fi
 
 resolve_template() {
   local arg="${1:-}"
-  local candidate
+  local path="${arg:-$DEFAULT_TEMPLATE}"
 
-  if [ -z "$arg" ]; then
-    echo "$DEFAULT_TEMPLATE"
-    return
+  if [ ! -f "$path" ] || [ ! -r "$path" ]; then
+    echo "error: template file not found or unreadable: ${path}" >&2
+    echo "Use -t /path/to/template.yaml (relative paths use the current directory)." >&2
+    return 1
   fi
 
-  # Absolute / relative path that exists
-  if [ -f "$arg" ]; then
-    # shellcheck disable=SC2164
-    (cd "$(dirname "$arg")" && echo "$(pwd)/$(basename "$arg")")
-    return
-  fi
-
-  # Bare path under the agent-vm directory
-  if [ -f "$SCRIPT_DIR/$arg" ]; then
-    echo "$SCRIPT_DIR/$arg"
-    return
-  fi
-
-  # Shorthand: -t docker → lima-docker.yaml.template
-  #             -t custom → lima-custom.yaml.template (local, gitignored)
-  for candidate in \
-    "$SCRIPT_DIR/lima-${arg}.yaml.template" \
-    "$SCRIPT_DIR/${arg}.yaml.template" \
-    "$SCRIPT_DIR/lima-${arg}.yaml" \
-    "$SCRIPT_DIR/${arg}.yaml"
-  do
-    if [ -f "$candidate" ]; then
-      echo "$candidate"
-      return
-    fi
-  done
-
-  echo "error: template not found: ${arg}" >&2
-  echo "Tried: path, ${SCRIPT_DIR}/${arg}, lima-${arg}.yaml.template" >&2
-  exit 1
+  (cd "$(dirname "$path")" && printf '%s/%s\n' "$(pwd)" "$(basename "$path")")
 }
 
 TEMPLATE="$(resolve_template "$TEMPLATE_ARG")"
@@ -263,6 +239,14 @@ clear_codex_auth() {
     "rm -f \"\$HOME/${CODEX_AUTH_GUEST_DIR}/auth.json\" \"\$HOME/${CODEX_AUTH_GUEST_DIR}/config.toml\"" >/dev/null 2>&1 || true
 }
 
+validate_config_json() {
+  local path="$1"
+  if ! jq -e -s 'length == 1 and (.[0] | type == "object")' "$path" >/dev/null; then
+    echo "error: invalid JSON object in ${path}; check JSON syntax (including trailing commas)." >&2
+    return 1
+  fi
+}
+
 prepare_pi_config() {
   local name="$1"
   local source_dir="$HOME/.pi/agent"
@@ -275,6 +259,13 @@ prepare_pi_config() {
     exit 1
   fi
 
+  local config_file
+  for config_file in "$source_dir/settings.json" "$source_dir/trust.json" "$source_dir/models.json" "$source_dir/auth.json"; do
+    if [ -f "$config_file" ]; then
+      validate_config_json "$config_file" || return 1
+    fi
+  done
+
   mkdir -p "$cache_root"
   chmod 700 "$cache_root"
   tmp_dir=$(mktemp -d "$cache_root/${name}.XXXXXX")
@@ -284,7 +275,7 @@ prepare_pi_config() {
   for file in settings.json trust.json; do
     if [ -f "$source_dir/$file" ]; then
       jq "walk(if type == \"object\" then with_entries(select(.key | test(\"${sensitive}\"; \"i\") | not)) else . end)" \
-        "$source_dir/$file" > "$tmp_dir/$file"
+        "$source_dir/$file" > "$tmp_dir/$file" || { rm -rf "$tmp_dir"; return 1; }
     fi
   done
 
@@ -308,14 +299,14 @@ prepare_pi_config() {
           baseUrl: ($base + "/openrouter"),
           apiKey: $dummy
         })
-    ' "$source_dir/models.json" > "$tmp_dir/models.json"
+    ' "$source_dir/models.json" > "$tmp_dir/models.json" || { rm -rf "$tmp_dir"; return 1; }
   else
     jq -n --arg base "$broker_base" --arg dummy "agent-vm-broker" '{
       providers: {
         "github-copilot": {baseUrl: ($base + "/github-copilot"), apiKey: $dummy},
         openrouter: {baseUrl: ($base + "/openrouter"), apiKey: $dummy}
       }
-    }' > "$tmp_dir/models.json"
+    }' > "$tmp_dir/models.json" || { rm -rf "$tmp_dir"; return 1; }
   fi
 
   {
@@ -347,6 +338,13 @@ prepare_opencode_config() {
   if [ ! -d "$source_dir" ] && [ ! -f "$auth_path" ]; then
     echo "error: host OpenCode config not found at ${source_dir}" >&2
     exit 1
+  fi
+
+  if [ -f "$source_json" ]; then
+    validate_config_json "$source_json" || return 1
+  fi
+  if [ -f "$auth_path" ]; then
+    validate_config_json "$auth_path" || return 1
   fi
 
   mkdir -p "$cache_root"
@@ -389,7 +387,7 @@ prepare_opencode_config() {
             })
           })
         )
-    ' "$source_json" > "$tmp_dir/opencode.json"
+    ' "$source_json" > "$tmp_dir/opencode.json" || { rm -rf "$tmp_dir"; return 1; }
   else
     jq -n --arg base "$broker_base" --arg dummy "$dummy" --argjson ids "$ids_json" '
       {
@@ -399,7 +397,7 @@ prepare_opencode_config() {
           | from_entries
         )
       }
-    ' > "$tmp_dir/opencode.json"
+    ' > "$tmp_dir/opencode.json" || { rm -rf "$tmp_dir"; return 1; }
   fi
 
   jq -n --arg dummy "$dummy" --argjson ids "$ids_json" '
@@ -592,7 +590,7 @@ cmd_shell() {
       echo "error: missing Pi credential broker: ${PI_BROKER_SCRIPT}" >&2
       exit 1
     fi
-    pi_config_path=$(prepare_pi_config "$vm_name")
+    pi_config_path=$(prepare_pi_config "$vm_name") || return 1
   fi
 
   if [ "$use_opencode_broker" = true ]; then
@@ -600,7 +598,7 @@ cmd_shell() {
       echo "error: missing OpenCode credential broker: ${OPENCODE_BROKER_SCRIPT}" >&2
       exit 1
     fi
-    opencode_config_path=$(prepare_opencode_config "$vm_name")
+    opencode_config_path=$(prepare_opencode_config "$vm_name") || return 1
     if jq -e 'length > 0' "$opencode_config_path/auth.json" >/dev/null 2>&1; then
       start_opencode_tunnel=true
     fi
@@ -616,7 +614,7 @@ cmd_shell() {
     generate_yaml "$project_path" "$pi_config_path" "$opencode_config_path" > "$tmpfile"
 
     echo "Creating agent VM for $(basename "$project_path")..."
-    echo "  template: $(basename "$TEMPLATE")"
+    echo "  template: $TEMPLATE"
     if ! limactl create --name "$vm_name" --tty=false "$tmpfile"; then
       rm -f "$tmpfile"
       echo "error: failed to create ${vm_name}" >&2
@@ -821,11 +819,11 @@ cmd_help() {
   echo "agent-vm — lightweight Alpine VMs for coding agents"
   echo ""
   echo "  agent-vm              Enter VM for current directory (creates on first run)"
-  echo "  agent-vm -t docker    Create with Docker template (first run only)"
-  echo "  agent-vm -t codex     Create with autonomous Codex, Docker, and ephemeral auth"
+  echo "  agent-vm -t /path/to/agent-vm/templates/lima-docker.yaml.template    Create with Docker template (first run only)"
+  echo "  agent-vm -t /path/to/agent-vm/templates/lima-codex.yaml.template     Create with autonomous Codex, Docker, and ephemeral auth"
   echo "  agent-vm --allow-domain HOST"
   echo "                        Allow one extra HTTPS hostname for this session"
-  echo "  agent-vm -t custom    Create with local custom template (first run only)"
+  echo "  agent-vm -t ~/.config/agent-vm/my.yaml    Create with local custom template (first run only)"
   echo "  agent-vm list         Show all agent VMs and their status"
   echo "  agent-vm status       Show VM for current directory"
   echo "  agent-vm stop [name]  Stop a VM (default: current dir's VM)"
@@ -833,10 +831,8 @@ cmd_help() {
   echo "  agent-vm delete [name] Delete a VM entirely"
   echo ""
   echo "Templates (used only when creating a new VM):"
-  echo "  -t, --template NAME   lima.yaml.template (default), docker, custom, or a path"
-  echo "                        Shorthand: docker → lima-docker.yaml.template"
-  echo "                                   codex  → lima-codex.yaml.template"
-  echo "                                   custom → lima-custom.yaml.template"
+  echo "  -t, --template PATH   Read a template file (absolute or relative to current directory)"
+  echo "                        Default: $DEFAULT_TEMPLATE"
   echo "  --allow-domain HOST   Repeatable; restricted Docker templates only"
   echo ""
   echo "Each project gets its own VM and stops when its shell exits."

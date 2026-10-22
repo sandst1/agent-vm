@@ -64,11 +64,11 @@ When you're done, `exit` the VM shell. agent-vm closes its SSH forwards and stop
 
 ```
 agent-vm              Enter VM for current directory (creates on first run)
-agent-vm -t docker    Create with the Docker template (first run only)
-agent-vm -t codex     Create with the Codex + Docker template (first run only)
+agent-vm -t /path/to/agent-vm/templates/lima-docker.yaml.template    Create with the Docker template (first run only)
+agent-vm -t /path/to/agent-vm/templates/lima-codex.yaml.template     Create with the Codex + Docker template (first run only)
 agent-vm --allow-domain HOST
                       Allow one extra HTTPS hostname for this session
-agent-vm -t custom    Create with your local custom template (first run only)
+agent-vm -t ~/.config/agent-vm/my.yaml    Create with your local custom template (first run only)
 agent-vm list         Show all agent VMs and their status
 agent-vm status       Show VM for current directory
 agent-vm stop [name]  Stop a VM (default: current dir's VM)
@@ -80,30 +80,33 @@ Stop/delete accept shorthand — `agent-vm stop customer-a` works (the `agent-` 
 
 ### Templates
 
-The default VM stays light ([`lima.yaml.template`](./lima.yaml.template)). Use a different template when creating a VM:
+The default is [`templates/lima.yaml.template`](./templates/lima.yaml.template). With no arguments, `agent-vm` uses it automatically, wherever you run the command.
+
+Use `-t` / `--template` with an explicit file path when creating a VM:
 
 ```bash
-agent-vm -t docker                         # lima-docker.yaml.template
-agent-vm -t codex                          # lima-codex.yaml.template
-agent-vm -t codex --allow-domain docs.example.com
-agent-vm --template lima-docker.yaml.template
-agent-vm -t custom                         # lima-custom.yaml.template (local only)
-agent-vm -t /path/to/my.yaml               # any Lima YAML
+agent-vm -t /path/to/agent-vm/templates/lima-docker.yaml.template
+agent-vm --template /path/to/agent-vm/templates/lima-codex.yaml.template
+agent-vm -t /path/to/agent-vm/templates/lima-codex.yaml.template --allow-domain docs.example.com
+agent-vm -t ~/.config/agent-vm/my.yaml
 ```
+
+Replace `/path/to/agent-vm` with your checkout location. Absolute paths work from any project directory. Relative paths resolve from your current directory; for example, `-t ./templates/lima-docker.yaml.template` works from the agent-vm checkout. Template names such as `-t docker` are no longer expanded.
 
 `-t` / `--template` only applies on **first create**. If the VM already exists, delete it first to recreate with another template.
 
-#### Local custom template (`agent-vm -t custom`)
+#### Private templates
 
-For a private image/stack you do not want in git, copy the example and edit it locally:
+Keep your private templates anywhere outside this public repository:
 
 ```bash
-cp lima-custom.yaml.template.example lima-custom.yaml.template
-# edit lima-custom.yaml.template — packages, images, CPUs/RAM, mounts, …
-agent-vm -t custom
+mkdir -p ~/.config/agent-vm
+cp /path/to/agent-vm/templates/lima-custom.yaml.template.example ~/.config/agent-vm/my.yaml
+# edit ~/.config/agent-vm/my.yaml — packages, images, CPUs/RAM, mounts, …
+agent-vm -t ~/.config/agent-vm/my.yaml
 ```
 
-`lima-custom.yaml.template` is gitignored. The committed starter is [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example).
+Local `templates/lima-custom.yaml.template` and `templates/lima-private.yaml.template` files are also gitignored.
 
 ## Resource usage
 
@@ -132,7 +135,7 @@ Alpine Linux 3.23 with:
 | [opencode](https://opencode.ai/) | AI coding agent |
 | opencode-loop | Autonomous loop runner for opencode |
 
-### Docker template (`agent-vm -t docker`)
+### Docker template
 
 Same stack as the default, plus rootless Docker Engine and Compose. Uses 6 GiB RAM and 30 GiB disk so image pulls don’t fill the VM immediately.
 
@@ -148,9 +151,9 @@ Host-level privileged containers and the host network namespace are not
 available; flags such as `--privileged` or `--network host` remain scoped to
 rootless Docker's user/network namespaces.
 
-### Codex template (`agent-vm -t codex`)
+### Codex template
 
-The public [`lima-codex.yaml.template`](./lima-codex.yaml.template) includes
+The public [`lima-codex.yaml.template`](./templates/lima-codex.yaml.template) includes
 [Codex CLI](https://learn.chatgpt.com/docs/codex/cli), rootless Docker Engine and
 Compose, Chromium, `agent-browser`, and the bundled `agent-browser` skill.
 Codex discovers the read-only skills mount at its standard admin location,
@@ -183,7 +186,7 @@ Some npm packages download binaries or source from other hosts in install
 scripts. Review the destination, then allow its exact hostname for one session:
 
 ```bash
-agent-vm -t codex --allow-domain releases.example.com
+agent-vm -t /path/to/agent-vm/templates/lima-codex.yaml.template --allow-domain releases.example.com
 # Repeat --allow-domain for multiple exact hostnames.
 ```
 
@@ -221,9 +224,9 @@ If the host uses keyring-only storage, no `auth.json` is available to copy; run
 `codex login --device-auth` inside the VM for that session, or configure
 file-backed host storage first. Treat `~/.codex/auth.json` like a password.
 
-### Custom template (`agent-vm -t custom`)
+### Custom template
 
-Same idea as Docker, but the file lives only on your machine. Start from [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example), customize freely, and create VMs with `-t custom`. Nothing under `lima-custom.yaml.template` is committed.
+Start from [`templates/lima-custom.yaml.template.example`](./templates/lima-custom.yaml.template.example), customize it outside this repository, and select it with `-t ~/.config/agent-vm/my.yaml`.
 
 ## opencode config — credentials stay on your Mac
 
@@ -236,21 +239,22 @@ Templates marked `# agent-vm: opencode-broker` (the default, Docker, and custom 
 
 Local providers without secrets (LAN `baseURL`s, no API key) are left pointing at their original endpoints.
 
+Host configuration files must contain valid JSON objects. If startup reports `invalid JSON object`, the message identifies the host file to fix. Comments and trailing commas are rejected; validation stops before VM creation or startup.
+
 Existing VMs keep their original mounts until you `agent-vm delete` and recreate them.
 
 The agent-vm skills bundled in this repo are still linked in as an additional skills directory.
 
 ## VM configuration
 
-Templates live next to the script:
+Bundled templates live in `templates/`:
 
 | File | When |
 |------|------|
-| [`lima.yaml.template`](./lima.yaml.template) | Default (light) |
-| [`lima-docker.yaml.template`](./lima-docker.yaml.template) | `agent-vm -t docker` |
-| [`lima-codex.yaml.template`](./lima-codex.yaml.template) | `agent-vm -t codex` (Codex + Docker + ephemeral auth) |
-| [`lima-custom.yaml.template.example`](./lima-custom.yaml.template.example) | Starter for local custom (copy → `lima-custom.yaml.template`) |
-| `lima-custom.yaml.template` | `agent-vm -t custom` (gitignored; create locally) |
+| [`templates/lima.yaml.template`](./templates/lima.yaml.template) | Default (light), no arguments needed |
+| [`templates/lima-docker.yaml.template`](./templates/lima-docker.yaml.template) | `agent-vm -t /path/to/agent-vm/templates/lima-docker.yaml.template` |
+| [`templates/lima-codex.yaml.template`](./templates/lima-codex.yaml.template) | `agent-vm -t /path/to/agent-vm/templates/lima-codex.yaml.template` |
+| [`templates/lima-custom.yaml.template.example`](./templates/lima-custom.yaml.template.example) | Starter to copy to a private location |
 
 When a new VM is created, the chosen template is copied and `{{PROJECT_PATH}}` / `{{SCRIPT_DIR}}` placeholders are substituted at runtime. You're encouraged to edit them — tweak CPU/RAM, add mounts, install extra packages, etc. Or pass `-t` with your own Lima YAML.
 

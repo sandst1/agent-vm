@@ -1,12 +1,13 @@
-# Agent VM with Docker — Alpine Linux
-# agent-vm: opencode-broker
+# Codex agent VM with Docker — Alpine Linux
+# agent-vm: codex-auth
 # agent-vm: restricted-egress
 #
-# Same base as lima.yaml.template, plus Docker Engine and more disk/RAM
-# for image pulls and compose stacks. Use when creating a VM:
+# Public template for Codex CLI, Docker, Chromium, and agent-browser:
 #
-#   agent-vm -t docker
+#   agent-vm -t /path/to/agent-vm/templates/lima-codex.yaml.template
 #
+# Codex credentials are injected by agent-vm into a memory-backed CODEX_HOME.
+# They are not baked into this template or mounted from the host.
 # {{PROJECT_PATH}} and {{SCRIPT_DIR}} are substituted at runtime.
 
 vmType: vz
@@ -28,58 +29,56 @@ containerd:
   user: false
 
 env:
-  AGENT_VM_OPENCODE_BROKER: "1"
+  AGENT_VM_CODEX_AUTH: "1"
   AGENT_VM_RESTRICTED_EGRESS: "1"
 
 mounts:
-  # Project directory — fixed path, symlinked from home in provisioning
+  # The selected project is the only host directory exposed to the VM.
   - location: "{{PROJECT_PATH}}"
     writable: true
     mountPoint: "/workspace"
 
-  # Sanitized OpenCode config (host credentials stay on the Mac)
-  - location: "{{OPENCODE_CONFIG_PATH}}"
-    writable: false
-    mountPoint: "/etc/opencode"
-
-  # agent-vm skills — symlinked into ~/.config/opencode/skills
+  # Codex discovers admin skills here. This includes agent-browser.
   - location: "{{SCRIPT_DIR}}/skills"
     writable: false
-    mountPoint: "/etc/agent-vm-skills"
+    mountPoint: "/etc/codex/skills"
 
 provision:
   - mode: system
     script: |
       #!/bin/sh
       set -eux
-      [ -f /etc/agent-vm-provisioned ] && exit 0
+      [ -f /etc/agent-vm-codex-provisioned ] && exit 0
 
       apk update
       apk add \
-        build-base \
-        git \
-        curl \
-        jq \
-        tmux \
-        ripgrep \
-        fd \
-        unzip \
         bash \
-        nodejs \
-        npm \
-        python3 \
-        py3-pip \
+        bubblewrap \
+        build-base \
         chromium \
-        font-noto \
-        font-noto-emoji \
+        curl \
         docker-cli \
         docker-cli-compose \
         docker-rootless-extras \
         docker-rootless-extras-openrc \
+        fd \
+        font-noto \
+        font-noto-emoji \
+        git \
+        jq \
+        nodejs \
         nftables \
+        npm \
+        py3-pip \
+        python3 \
+        ripgrep \
         shadow-subids \
-        socat
+        socat \
+        tmux \
+        unzip
 
+      # Rootless Docker prerequisites. The login user already exists when Lima
+      # runs system provisioning.
       agent_user="{{USER}}"
       [ -n "$agent_user" ]
       agent_uid="$(id -u "$agent_user")"
@@ -110,6 +109,9 @@ provision:
 
       install -d -m 700 -o "$agent_uid" -g "$agent_gid" "/run/user/${agent_uid}"
 
+      # Only the login user's direct IP egress is denied. Root-owned system
+      # services and Lima provisioning remain functional. HTTPS exits through
+      # the host allowlist proxy over the SSH loopback tunnel.
       cat > /etc/nftables.nft << NFT
       table inet agent_vm_egress {
         chain output {
@@ -187,11 +189,10 @@ provision:
       DOCKER_START
       chmod 755 /usr/local/bin/agent-vm-start-docker
 
-      npm install -g agent-browser
+      npm install -g @openai/codex agent-browser
 
-      # Global PATH and browser config for agent tools
-      cat > /etc/profile.d/agent-vm.sh << 'PROF'
-      export PATH="$HOME/.opencode/bin:/usr/local/bin:$PATH"
+      cat > /etc/profile.d/agent-vm-codex.sh << 'PROFILE'
+      export CODEX_HOME="$HOME/.codex"
       export XDG_RUNTIME_DIR="/run/user/$(id -u)"
       export DOCKER_HOST="unix:///tmp/agent-vm-docker.sock"
       export HTTP_PROXY="http://127.0.0.1:43113"
@@ -202,11 +203,33 @@ provision:
       export no_proxy="$NO_PROXY"
       export AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser
       export AGENT_BROWSER_ARGS="--no-sandbox,--disable-gpu,--disable-dev-shm-usage"
-      PROF
-      chmod +x /etc/profile.d/agent-vm.sh
+      PROFILE
+      chmod +x /etc/profile.d/agent-vm-codex.sh
 
-      touch /etc/agent-vm-provisioned
+      # Codex stays approval-free inside the non-root guest boundary.
+      mkdir -p /etc/codex
+      cat > /etc/codex/config.toml << CONFIG
+      cli_auth_credentials_store = "file"
+      approval_policy = "never"
+      sandbox_mode = "danger-full-access"
 
+      [features.network_proxy]
+      enabled = true
+      allow_local_binding = true
+
+      [features.network_proxy.unix_sockets]
+      "/tmp/agent-vm-docker.sock" = "allow"
+
+      [features.network_proxy.domains]
+      "registry.npmjs.org" = "allow"
+      "localhost" = "allow"
+      "127.0.0.1" = "allow"
+      CONFIG
+
+      touch /etc/agent-vm-codex-provisioned
+
+  # Recreate runtime state on every boot. After first-boot user setup, enforce
+  # the firewall and remove Lima's blanket interactive sudo grant before login.
   - mode: system
     script: |
       #!/bin/sh
@@ -216,7 +239,12 @@ provision:
       agent_gid="$(id -g "$agent_user")"
       agent_home="$(getent passwd "$agent_user" | cut -d: -f6)"
       install -d -m 700 -o "$agent_uid" -g "$agent_gid" "/run/user/${agent_uid}"
-      if [ -f "$agent_home/.agent-vm-user-provisioned" ]; then
+      install -d -m 700 -o "$agent_uid" -g "$agent_gid" "$agent_home/.codex"
+      if ! mountpoint -q "$agent_home/.codex"; then
+        mount -t tmpfs -o "mode=700,uid=${agent_uid},gid=${agent_gid},size=128m" \
+          codex-home "$agent_home/.codex"
+      fi
+      if [ -f "$agent_home/.agent-vm-codex-user-provisioned" ]; then
         nft delete table inet agent_vm_egress 2>/dev/null || true
         nft -f /etc/nftables.nft
         rm -f /etc/sudoers.d/90-lima-users
@@ -226,49 +254,29 @@ provision:
     script: |
       #!/bin/sh
       set -eux
-      [ -f ~/.agent-vm-user-provisioned ] && exit 0
 
-      curl -fsSL https://opencode.ai/install | sh
+      first_boot=false
+      if [ ! -f ~/.agent-vm-codex-user-provisioned ]; then
+        first_boot=true
+        ln -sfn /workspace ~/project
+        ln -sfn /workspace ~/p
 
-      git clone https://github.com/sandst1/opencode-loop.git ~/.local/share/opencode-loop
-      cd ~/.local/share/opencode-loop
-      npm install
-      npm run build
-      ln -sf ~/.local/share/opencode-loop/dist/index.js ~/.opencode/bin/opencode-loop
+        npm config set proxy http://127.0.0.1:43113
+        npm config set https-proxy http://127.0.0.1:43113
 
-      ln -sf /workspace ~/project
-      ln -sf /workspace ~/p
-
-      mkdir -p ~/.config/opencode
-      for f in /etc/opencode/*; do
-        [ -e "$f" ] || continue
-        # skills merged separately — ln -sf into a dir-symlink follows it
-        # and never replaces ~/.config/opencode/skills
-        [ "$(basename "$f")" = "skills" ] && continue
-        [ "$(basename "$f")" = "auth.json" ] && continue
-        ln -sfn "$f" ~/.config/opencode/
-      done
-
-      # Real directory so host + agent-vm skills can coexist
-      if [ -L ~/.config/opencode/skills ]; then
-        rm ~/.config/opencode/skills
+        mkdir -p ~/.docker
+        guest_ip="$(getent hosts agent-vm-egress.internal | awk 'NR == 1 { print $1 }')"
+        printf '%s\n' "{\"proxies\":{\"default\":{\"httpProxy\":\"http://${guest_ip}:43113\",\"httpsProxy\":\"http://${guest_ip}:43113\",\"noProxy\":\"127.0.0.1,localhost\"}}}" > ~/.docker/config.json
+        chmod 600 ~/.docker/config.json
+        touch ~/.agent-vm-codex-user-provisioned
       fi
-      mkdir -p ~/.config/opencode/skills
-      for s in /etc/opencode/skills/*; do
-        [ -e "$s" ] && ln -sfn "$s" ~/.config/opencode/skills/
-      done
-      for s in /etc/agent-vm-skills/*; do
-        [ -e "$s" ] && ln -sfn "$s" ~/.config/opencode/skills/
-      done
 
-      npm config set proxy http://127.0.0.1:43113
-      npm config set https-proxy http://127.0.0.1:43113
+      # The root-mounted ~/.codex tmpfs is recreated on every VM start.
+      # agent-vm copies auth.json into it before opening the shell.
+      mkdir -p ~/.codex
+      chmod 700 ~/.codex
 
-      mkdir -p ~/.docker
-      guest_ip="$(getent hosts agent-vm-egress.internal | awk 'NR == 1 { print $1 }')"
-      printf '%s\n' "{\"proxies\":{\"default\":{\"httpProxy\":\"http://${guest_ip}:43113\",\"httpsProxy\":\"http://${guest_ip}:43113\",\"noProxy\":\"127.0.0.1,localhost\"}}}" > ~/.docker/config.json
-      chmod 600 ~/.docker/config.json
-
-      touch ~/.agent-vm-user-provisioned
-      sudo nft -f /etc/nftables.nft
-      sudo rm -f /etc/sudoers.d/90-lima-users
+      if [ "$first_boot" = true ]; then
+        sudo nft -f /etc/nftables.nft
+        sudo rm -f /etc/sudoers.d/90-lima-users
+      fi
