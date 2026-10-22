@@ -69,6 +69,7 @@ provision:
         nodejs \
         nftables \
         npm \
+        procps \
         py3-pip \
         python3 \
         ripgrep \
@@ -241,7 +242,7 @@ provision:
       install -d -m 700 -o "$agent_uid" -g "$agent_gid" "/run/user/${agent_uid}"
       install -d -m 700 -o "$agent_uid" -g "$agent_gid" "$agent_home/.codex"
       if ! mountpoint -q "$agent_home/.codex"; then
-        mount -t tmpfs -o "mode=700,uid=${agent_uid},gid=${agent_gid},size=1g" \
+        mount -t tmpfs -o "mode=700,uid=${agent_uid},gid=${agent_gid},size=6g" \
           codex-home "$agent_home/.codex"
       fi
       if [ -f "$agent_home/.agent-vm-codex-user-provisioned" ]; then
